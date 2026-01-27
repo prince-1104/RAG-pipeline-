@@ -40,8 +40,8 @@ def get_llm_client() -> LLMClient:
         )
         return RaceLLMClient(gemini_client=gemini_client, openrouter_client=openrouter_client)
     if provider == "fallback":
-        # Fallback mode: try GPT (OpenRouter) first, fall back to Gemini if GPT fails
-        # Requirement: GPT-4.1-mini primary, Gemini secondary
+        # Fallback mode: try Gemini first, fall back to GPT-4o-mini (OpenRouter) if Gemini fails
+        # Requirement: Gemini primary, GPT-4o-mini secondary
         if not s.gemini_api_key:
             raise RuntimeError("missing_GEMINI_API_KEY_for_fallback_mode")
         if not s.openrouter_api_key:

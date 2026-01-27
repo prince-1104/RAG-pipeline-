@@ -77,9 +77,9 @@ class OpenRouterClient:
                         logger.error(f"Failed to parse OpenRouter response: {e}")
                         # Fall through to stub fallback below
 
-                # Handle errors - log but don't raise yet, fall back to stub
+                # Handle errors - raise exceptions so FallbackLLMClient can catch and try Gemini
                 if resp.status_code == 401 or resp.status_code == 403:
-                    # Authentication error - log and fall back
+                    # Authentication error - raise so fallback client can try Gemini
                     import logging
                     logger = logging.getLogger(__name__)
                     try:
@@ -88,9 +88,9 @@ class OpenRouterClient:
                     except Exception:
                         error_msg = resp.text[:200]
                     logger.error(f"OpenRouter API authentication failed: {error_msg}")
-                    # Fall through to stub fallback
+                    raise RuntimeError(f"OpenRouter API authentication failed: {error_msg}")
 
-                # For other errors, log and fall back
+                # For other errors, raise so fallback client can try Gemini
                 if not resp.is_success:
                     import logging
                     logger = logging.getLogger(__name__)
@@ -100,47 +100,17 @@ class OpenRouterClient:
                     except Exception:
                         error_msg = resp.text[:200]
                     logger.warning(f"OpenRouter API error (HTTP {resp.status_code}): {error_msg}")
-                    # Fall through to stub fallback
+                    raise RuntimeError(f"OpenRouter API error (HTTP {resp.status_code}): {error_msg}")
 
         except httpx.HTTPStatusError as e:
-            last_exception = e
+            # Re-raise HTTP errors so FallbackLLMClient can catch and try Gemini
             try:
-                last_status = e.response.status_code
-                last_resp_text = e.response.text
+                error_data = e.response.json()
+                error_msg = error_data.get("error", {}).get("message", e.response.text[:200])
             except Exception:
-                pass
-            # Fall through to stub fallback
+                error_msg = e.response.text[:200]
+            raise RuntimeError(f"OpenRouter API HTTP error ({e.response.status_code}): {error_msg}") from e
 
         except Exception as e:
-            last_exception = e
-            # Fall through to stub fallback
-
-        # If we get here, something went wrong - fall back to stub
-        import logging
-        logger = logging.getLogger(__name__)
-        error_summary = []
-        if last_status:
-            error_summary.append(f"HTTP {last_status}")
-        if last_resp_text:
-            try:
-                error_json = json.loads(last_resp_text)
-                if "error" in error_json:
-                    error_summary.append(f"Error: {error_json['error'].get('message', 'Unknown error')}")
-            except Exception:
-                error_summary.append(f"Response: {last_resp_text[:200]}")
-        if last_exception:
-            error_summary.append(f"Exception: {str(last_exception)[:200]}")
-        
-        error_msg = "; ".join(error_summary) if error_summary else "Unknown error"
-        
-        logger.warning(
-            f"OpenRouter API failed, falling back to stub LLM. Error: {error_msg}",
-            extra={"status": last_status, "error": error_msg}
-        )
-
-        # Fallback to stub
-        return StubLLMClient().generate_json(
-            system_prompt=system_prompt,
-            user_prompt=user_prompt,
-            json_schema=json_schema
-        )
+            # Re-raise other exceptions so FallbackLLMClient can catch and try Gemini
+            raise RuntimeError(f"OpenRouter API request failed: {str(e)[:200]}") from e

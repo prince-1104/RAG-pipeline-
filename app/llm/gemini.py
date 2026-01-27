@@ -20,15 +20,14 @@ def _repair_json(text: str) -> str:
     - Control characters
     - JSON wrapped in markdown code blocks
     - Unterminated strings (truncated responses) - improved detection
+    - Single quotes instead of double quotes
+    - Unquoted property names
     """
     if not text:
         return text
     
     # Remove control characters except newlines and tabs
     text = re.sub(r'[\x00-\x08\x0b-\x0c\x0e-\x1f]', '', text)
-    
-    # Try to fix trailing commas
-    text = re.sub(r',(\s*[}\]])', r'\1', text)
     
     # Try to extract JSON from markdown code blocks if present
     json_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', text, re.DOTALL)
@@ -39,6 +38,20 @@ def _repair_json(text: str) -> str:
     json_match = re.search(r'(\{.*\}|\[.*\])', text, re.DOTALL)
     if json_match:
         text = json_match.group(1)
+    
+    # Fix unquoted property names (e.g., key: value -> "key": value)
+    # Pattern: word character sequence followed by colon (not inside quotes)
+    # Only match at the start of a line or after whitespace/comma/brace
+    text = re.sub(r'([{,]\s*)([a-zA-Z_][a-zA-Z0-9_]*)\s*:', r'\1"\2":', text)
+    
+    # Fix single quotes to double quotes (but be careful with apostrophes in strings)
+    # Only replace single quotes that are clearly property delimiters
+    # Pattern: 'key': or 'key', or : 'value' or , 'value'
+    text = re.sub(r"'(\w+)'(\s*:)", r'"\1"\2', text)  # 'key': -> "key":
+    text = re.sub(r"(\s*:\s*)'([^']*)'", r'\1"\2"', text)  # : 'value' -> : "value"
+    
+    # Try to fix trailing commas
+    text = re.sub(r',(\s*[}\]])', r'\1', text)
     
     # Improved unterminated string detection and repair
     # First pass: track string boundaries to detect unterminated strings

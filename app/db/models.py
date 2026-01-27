@@ -15,6 +15,7 @@ class JobKind(str, enum.Enum):
     generate = "generate"
     generate_question_pool = "generate_question_pool"
     refresh_question_pool = "refresh_question_pool"
+    admin_generate_questions = "admin_generate_questions"
     
     def __str__(self) -> str:
         """Ensure str() returns the enum value, not the member name."""

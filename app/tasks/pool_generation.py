@@ -56,6 +56,38 @@ def generate_question_pool(
     """
     # Step 1: Get or create pool
     pool = get_or_create_pool(syllabus, class_level, subject, difficulty, syllabus_version)
+
+    # #region agent log
+    try:
+        import time as _t
+        with open(r"d:\Hopper\NMC projects\RAG-QNA\niyukti-que-gen-Engine\.cursor\debug.log", "a", encoding="utf-8") as _f:
+            _f.write(
+                json.dumps(
+                    {
+                        "sessionId": "debug-session",
+                        "runId": "run1",
+                        "hypothesisId": "A",
+                        "location": "pool_generation.py:generate_question_pool:entry",
+                        "message": "pool_generation_entry",
+                        "data": {
+                            "pool_id": pool.id,
+                            "pool_status": str(pool.status),
+                            "corpus_id": corpus_id,
+                            "syllabus": syllabus,
+                            "class_level": class_level,
+                            "subject": subject,
+                            "difficulty": difficulty,
+                            "syllabus_version": syllabus_version,
+                            "target_count": target_count,
+                        },
+                        "timestamp": int(_t.time() * 1000),
+                    }
+                )
+                + "\n"
+            )
+    except Exception:
+        pass
+    # #endregion
     
     if pool.status == QuestionPoolStatus.ready:
         log.info("pool_already_ready", pool_id=pool.id)
@@ -78,6 +110,33 @@ def generate_question_pool(
             query=query,
             top_k=top_k,
         )
+
+        # #region agent log
+        try:
+            import time as _t
+            with open(r"d:\Hopper\NMC projects\RAG-QNA\niyukti-que-gen-Engine\.cursor\debug.log", "a", encoding="utf-8") as _f:
+                _f.write(
+                    json.dumps(
+                        {
+                            "sessionId": "debug-session",
+                            "runId": "run1",
+                            "hypothesisId": "B",
+                            "location": "pool_generation.py:generate_question_pool:after_retrieve",
+                            "message": "retrieval_result",
+                            "data": {
+                                "pool_id": pool.id,
+                                "chunks": len(rr.chunks) if rr and rr.chunks else 0,
+                                "confidence": getattr(rr, "confidence", None),
+                                "query": getattr(rr, "query", "")[:200],
+                            },
+                            "timestamp": int(_t.time() * 1000),
+                        }
+                    )
+                    + "\n"
+                )
+        except Exception:
+            pass
+        # #endregion
         
         if not rr.chunks or len(rr.chunks) < 3:
             raise ValueError(f"Insufficient chunks retrieved: {len(rr.chunks) if rr.chunks else 0}")
@@ -96,12 +155,39 @@ def generate_question_pool(
             raise ValueError("No examinable concepts extracted")
         
         log.info("concepts_extracted", pool_id=pool.id, concept_count=len(concepts))
+
+        # #region agent log
+        try:
+            import time as _t
+            with open(r"d:\Hopper\NMC projects\RAG-QNA\niyukti-que-gen-Engine\.cursor\debug.log", "a", encoding="utf-8") as _f:
+                _f.write(
+                    json.dumps(
+                        {
+                            "sessionId": "debug-session",
+                            "runId": "run1",
+                            "hypothesisId": "C",
+                            "location": "pool_generation.py:generate_question_pool:concepts",
+                            "message": "concepts_extracted",
+                            "data": {
+                                "pool_id": pool.id,
+                                "concept_count": len(concepts),
+                                "concept_sample": concepts[:5],
+                                "questions_per_concept": max(1, target_count // max(1, len(concepts))),
+                            },
+                            "timestamp": int(_t.time() * 1000),
+                        }
+                    )
+                    + "\n"
+                )
+        except Exception:
+            pass
+        # #endregion
         
         # Step 4: Phase 2 - Generate questions per concept
         all_questions: list[dict] = []
         questions_per_concept = max(1, target_count // len(concepts))
         
-        for concept in concepts:
+        for idx, concept in enumerate(concepts):
             try:
                 concept_questions = _generate_questions_for_concept(
                     concept=concept,
@@ -112,6 +198,36 @@ def generate_question_pool(
                     corpus_id=corpus_id,
                 )
                 all_questions.extend(concept_questions)
+
+                # #region agent log
+                # Log only first few concepts to keep logs small.
+                if idx < 3:
+                    try:
+                        import time as _t
+                        with open(r"d:\Hopper\NMC projects\RAG-QNA\niyukti-que-gen-Engine\.cursor\debug.log", "a", encoding="utf-8") as _f:
+                            _f.write(
+                                json.dumps(
+                                    {
+                                        "sessionId": "debug-session",
+                                        "runId": "run1",
+                                        "hypothesisId": "D",
+                                        "location": "pool_generation.py:generate_question_pool:concept_loop",
+                                        "message": "concept_generation_summary",
+                                        "data": {
+                                            "pool_id": pool.id,
+                                            "concept_idx": idx,
+                                            "concept": concept[:120],
+                                            "returned": len(concept_questions),
+                                            "total_so_far": len(all_questions),
+                                        },
+                                        "timestamp": int(_t.time() * 1000),
+                                    }
+                                )
+                                + "\n"
+                            )
+                    except Exception:
+                        pass
+                # #endregion
                 
                 # Stop if we have enough questions
                 if len(all_questions) >= target_count:
@@ -121,6 +237,34 @@ def generate_question_pool(
                 continue
         
         if len(all_questions) < 50:  # Minimum viable pool size
+            # #region agent log
+            try:
+                import time as _t
+                with open(r"d:\Hopper\NMC projects\RAG-QNA\niyukti-que-gen-Engine\.cursor\debug.log", "a", encoding="utf-8") as _f:
+                    _f.write(
+                        json.dumps(
+                            {
+                                "sessionId": "debug-session",
+                                "runId": "run1",
+                                "hypothesisId": "E",
+                                "location": "pool_generation.py:generate_question_pool:insufficient",
+                                "message": "insufficient_questions",
+                                "data": {
+                                    "pool_id": pool.id,
+                                    "generated": len(all_questions),
+                                    "min_required": 50,
+                                    "target_count": target_count,
+                                    "concept_count": len(concepts),
+                                    "questions_per_concept": questions_per_concept,
+                                },
+                                "timestamp": int(_t.time() * 1000),
+                            }
+                        )
+                        + "\n"
+                    )
+            except Exception:
+                pass
+            # #endregion
             raise ValueError(f"Insufficient questions generated: {len(all_questions)}")
         
         # Step 5: Store questions in DB
@@ -194,7 +338,17 @@ def _extract_concepts(
             json_schema=concept_schema,
         )
         
-        concepts = result.parsed_json.get("concepts", [])
+        # Handle both cases: object with "concepts" key, or direct array
+        parsed = result.parsed_json
+        if isinstance(parsed, list):
+            # Gemini returned array directly
+            concepts = parsed
+        elif isinstance(parsed, dict):
+            # Gemini returned object with "concepts" key
+            concepts = parsed.get("concepts", [])
+        else:
+            concepts = []
+        
         if not isinstance(concepts, list):
             concepts = []
         
@@ -291,7 +445,8 @@ def _generate_questions_for_concept(
                 cit["storage_uri"] = doc_uri_map.get(did, cit.get("storage_uri", ""))
         
         # Filter by difficulty and apply guardrails
-        valid_questions = []
+        valid_questions: list[dict] = []
+        rej_counts: dict[str, int] = {}
         for q in questions:
             # Ensure difficulty matches
             q["difficulty"] = difficulty
@@ -305,6 +460,8 @@ def _generate_questions_for_concept(
             rej = reject_if_exact_duplicate(corpus_id=corpus_id, key=dk) or reject_if_embedding_duplicate(
                 corpus_id=corpus_id, stem=stem
             )
+            if rej:
+                rej_counts[rej.reason] = rej_counts.get(rej.reason, 0) + 1
             if not rej:
                 c0 = (q.get("citations") or [{}])[0]
                 rej = reject_if_low_support(
@@ -312,10 +469,40 @@ def _generate_questions_for_concept(
                     explanation=q.get("explanation"),
                     excerpt=str(c0.get("excerpt") or ""),
                 )
+                if rej:
+                    rej_counts[rej.reason] = rej_counts.get(rej.reason, 0) + 1
             
             if not rej:
                 q["tags"] = {**(q.get("tags") or {}), "chapter": chapter, "dedupe_key": dk, "concept": concept}
                 valid_questions.append(q)
+
+        # #region agent log
+        try:
+            import time as _t
+            with open(r"d:\Hopper\NMC projects\RAG-QNA\niyukti-que-gen-Engine\.cursor\debug.log", "a", encoding="utf-8") as _f:
+                _f.write(
+                    json.dumps(
+                        {
+                            "sessionId": "debug-session",
+                            "runId": "run1",
+                            "hypothesisId": "F",
+                            "location": "pool_generation.py:_generate_questions_for_concept:summary",
+                            "message": "concept_questions_counts",
+                            "data": {
+                                "concept": concept[:120],
+                                "raw_questions": len(questions),
+                                "valid_questions": len(valid_questions),
+                                "issues_count": len(issues),
+                                "reject_reasons": rej_counts,
+                            },
+                            "timestamp": int(_t.time() * 1000),
+                        }
+                    )
+                    + "\n"
+                )
+        except Exception:
+            pass
+        # #endregion
         
         return valid_questions[:count]  # Limit to requested count
         

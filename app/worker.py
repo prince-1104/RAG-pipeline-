@@ -11,6 +11,7 @@ from app.db.session import get_session, init_db
 from app.indexing.index_job import run_index_job
 from app.observability.logging import configure_logging, log
 from app.settings import get_settings
+from app.tasks.admin_generate_job import run_admin_generate_job
 from app.tasks.generate_job import run_generate_job
 from app.tasks.pool_generation import generate_question_pool
 
@@ -124,6 +125,10 @@ def run_forever() -> None:
                     target_count=200,
                 )
                 _finish_job_success(job.id, result={"ok": True, "pool_refreshed": True})
+            elif job.kind == JobKind.admin_generate_questions:
+                # Admin-triggered question generation (ONLY place LLM calls are allowed)
+                result = run_admin_generate_job(job)
+                _finish_job_success(job.id, result=result)
             else:
                 raise RuntimeError(f"unsupported_job_kind:{job.kind.value}")
         except Exception as e:  # noqa: BLE001
