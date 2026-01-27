@@ -159,6 +159,9 @@ async def ingest_pdf(
 
             # Get or create corpus for this tenant
             corpus_id = _get_or_create_niyukti_corpus(tenant_id, board)
+            if not corpus_id:
+                log.error("corpus_creation_failed", tenant_id=tenant_id, board=board)
+                raise HTTPException(status_code=500, detail="corpus_creation_failed")
             
             # Create Document record
             with get_session() as session:
@@ -174,6 +177,9 @@ async def ingest_pdf(
                 session.commit()
                 session.refresh(document)
                 document_id = document.id
+                if not document.corpus_id:
+                    log.error("document_missing_corpus_id", document_id=document_id, tenant_id=tenant_id)
+                    raise HTTPException(status_code=500, detail="document_missing_corpus_id")
                 
                 # Update ingest job with corpus_id
                 job = session.get(GenerationJob, job_id)
@@ -196,6 +202,9 @@ async def ingest_pdf(
                 session.commit()
                 session.refresh(index_job)
                 index_job_id = index_job.id
+                if not index_job.corpus_id:
+                    log.error("index_job_missing_corpus_id", index_job_id=index_job_id, tenant_id=tenant_id)
+                    raise HTTPException(status_code=500, detail="index_job_missing_corpus_id")
 
             # Mark ingest job as succeeded
             with get_session() as session:
@@ -208,6 +217,7 @@ async def ingest_pdf(
                         "doc_id": doc_id,
                         "document_id": document_id,
                         "index_job_id": index_job_id,
+                        "corpus_id": corpus_id,
                     })
                     session.commit()
 
@@ -227,6 +237,7 @@ async def ingest_pdf(
             return PDFIngestResponse(
                 success=True,
                 doc_id=doc_id,
+                corpus_id=corpus_id,
                 storage_uri=storage_uri,
                 job_id=job_id,
                 index_job_id=index_job_id,
@@ -252,6 +263,25 @@ async def ingest_pdf(
                         job.error_message = error_msg
                         session.commit()
             raise HTTPException(status_code=400, detail=error_msg) from e
+
+        except HTTPException as e:
+            error_msg = str(e.detail)
+            log.error(
+                "ingest_corpus_error",
+                doc_id=doc_id,
+                error=error_msg,
+                job_id=job_id,
+            )
+            if job_id:
+                with get_session() as session:
+                    job = session.get(GenerationJob, job_id)
+                    if job:
+                        job.status = JobStatus.failed
+                        job.finished_at = datetime.utcnow()
+                        job.error_code = "corpus_error"
+                        job.error_message = error_msg
+                        session.commit()
+            raise
 
         except Exception as e:
             # R2 upload errors

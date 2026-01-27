@@ -15,6 +15,7 @@ class PDFIngestResponse(BaseModel):
     """Response for PDF ingestion."""
     success: bool
     doc_id: str
+    corpus_id: str | None = None
     storage_uri: str | None = None
     job_id: str | None = None  # Ingest job ID
     index_job_id: str | None = None  # Index job ID (for tracking indexing progress)

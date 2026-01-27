@@ -34,7 +34,7 @@ def run_admin_generate_job(job) -> dict:
     job_data = json.loads(job.request_json)
     
     document_id = job_data["document_id"]
-    corpus_id = job_data["corpus_id"]
+    corpus_id = job_data.get("corpus_id")
     from_class = job_data["from_class"]
     to_class = job_data["to_class"]
     subject = job_data["subject"]
@@ -56,6 +56,27 @@ def run_admin_generate_job(job) -> dict:
         question_count=question_count,
     )
     
+    # Resolve corpus_id fallback for legacy jobs (admin-only)
+    if not corpus_id:
+        tenant_fallback = job_data.get("tenant_id") or getattr(job, "tenant_id", None)
+        log.warning(
+            "corpus_id missing; falling back to tenant_id (admin-only)",
+            job_id=job.id,
+            tenant_id=tenant_fallback,
+        )
+        if tenant_fallback:
+            from app.db.models import Corpus
+
+            with get_session() as session:
+                corpus = session.exec(
+                    select(Corpus).where(Corpus.tenant_id == tenant_fallback).limit(1)
+                ).first()
+            if not corpus:
+                raise ValueError("corpus_not_found_for_tenant_fallback")
+            corpus_id = corpus.id
+        else:
+            raise ValueError("corpus_id_missing_and_no_tenant_fallback")
+
     # Get document to verify it exists
     with get_session() as session:
         from app.db.models import Document

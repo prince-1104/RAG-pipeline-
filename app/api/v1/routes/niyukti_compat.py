@@ -4,6 +4,7 @@ from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 
 from app.api.v1.schemas.generation import GenerateRequest, GenerateResponse
 from app.api.v1.schemas.ingest import PDFIngestResponse
+from app.api.v1.schemas.pools import PoolDifficultyStatus, PoolStatusResponse
 from app.api.v1.schemas.niyukti_compat import (
     NiyuktiGenerateRequest,
     NiyuktiGenerateResponse,
@@ -85,6 +86,22 @@ async def ingest_pdf_niyukti(
     )
     
     # Delegate to the main ingest implementation with tenant_id
+    return await ingest_pdf(file, doc_id, board, class_level, subject, tenant_id)
+
+
+@router.post("/ingest/pdf", response_model=PDFIngestResponse)
+async def ingest_pdf_niyukti_pdf(
+    request: Request,
+    file: UploadFile = File(..., description="PDF file to upload"),
+    doc_id: str = Form(..., description="Document ID provided by caller"),
+    board: str = Form(..., description="Board identifier (e.g., 'CBSE')"),
+    class_level: int = Form(..., ge=1, le=12, description="Class level (1-12)"),
+    subject: str = Form(..., description="Subject name"),
+):
+    """
+    Compatibility alias for Niyukti: POST /api/v1/ingest/pdf.
+    """
+    tenant_id = request.headers.get("X-Tenant-ID", "niyukti-platform")
     return await ingest_pdf(file, doc_id, board, class_level, subject, tenant_id)
 
 
@@ -389,6 +406,110 @@ def _convert_pool_questions_to_niyukti_format(
     return NiyuktiGenerateResponse(questions=niyukti_questions)
 
 
+@router.get("/pool/status", response_model=PoolStatusResponse)
+def get_pool_status_endpoint(
+    request: Request,
+    class_level: int,
+    subject: str,
+    syllabus: str = "CBSE",
+    syllabus_version: str = "2024",
+):
+    """
+    Read-only pool status endpoint.
+    Requires X-Corpus-ID; never triggers generation.
+    """
+    from sqlalchemy import func
+    from sqlmodel import select
+
+    from app.cache.redis_client import get_redis_client
+    from app.db.models import PoolQuestion, QuestionPool, QuestionPoolStatus
+    from app.pools.service import get_pool_key
+
+    tenant_id = request.headers.get("X-Tenant-ID")
+    corpus_id = request.headers.get("X-Corpus-ID")
+    if not corpus_id:
+        raise HTTPException(status_code=400, detail="missing_corpus_id")
+
+    with get_session() as session:
+        corpus = session.get(Corpus, corpus_id)
+        if not corpus:
+            raise HTTPException(status_code=404, detail="corpus_not_found")
+        if tenant_id and corpus.tenant_id != tenant_id:
+            from app.observability.logging import log
+
+            log.warning(
+                "tenant_mismatch_ignored_for_corpus_id",
+                tenant_id=tenant_id,
+                corpus_id=corpus_id,
+                corpus_tenant_id=corpus.tenant_id,
+            )
+
+    mapped_subject = _map_subject_name(subject)
+    redis_client = get_redis_client()
+
+    pools: dict[str, PoolDifficultyStatus] = {}
+    statuses: list[str] = []
+
+    with get_session() as session:
+        for difficulty in ["easy", "medium", "hard"]:
+            pool = session.exec(
+                select(QuestionPool).where(
+                    QuestionPool.syllabus == syllabus,
+                    QuestionPool.class_level == class_level,
+                    QuestionPool.subject == mapped_subject,
+                    QuestionPool.difficulty == difficulty,
+                    QuestionPool.syllabus_version == syllabus_version,
+                )
+            ).first()
+
+            if not pool:
+                pools[difficulty] = PoolDifficultyStatus(status="missing", count=0)
+                statuses.append("missing")
+                continue
+
+            pool_status = pool.status.value if isinstance(pool.status, QuestionPoolStatus) else str(pool.status)
+            pool_key = get_pool_key(syllabus, class_level, mapped_subject, difficulty, syllabus_version)
+            redis_count = int(redis_client.llen(pool_key))
+
+            if redis_count == 0:
+                redis_count = int(
+                    session.exec(
+                        select(func.count(PoolQuestion.id)).where(PoolQuestion.pool_id == pool.id)
+                    ).one()
+                    or 0
+                )
+
+            pools[difficulty] = PoolDifficultyStatus(
+                status=pool_status,  # type: ignore[arg-type]
+                count=redis_count,
+                requested_count=pool.requested_count,
+                generated_count=pool.generated_count,
+                last_error=pool.last_error,
+            )
+            statuses.append(pool_status)
+
+    if any(status == "failed" for status in statuses):
+        overall_status = "failed"
+    elif any(status == "generating" for status in statuses):
+        overall_status = "generating"
+    elif any(status in ("pending", "missing") for status in statuses):
+        overall_status = "pending"
+    elif any(status == "ready_partial" for status in statuses):
+        overall_status = "ready_partial"
+    else:
+        overall_status = "ready"
+
+    return PoolStatusResponse(
+        corpus_id=corpus_id,
+        syllabus=syllabus,
+        syllabus_version=syllabus_version,
+        class_level=class_level,
+        subject=mapped_subject,
+        status=overall_status,  # type: ignore[arg-type]
+        pools=pools,  # type: ignore[arg-type]
+    )
+
+
 def _trigger_pool_generation(
     corpus_id: str,
     syllabus: str,
@@ -522,40 +643,25 @@ def _generate_questions_niyukti_impl(request: Request, req: NiyuktiGenerateReque
     try:
         from app.observability.logging import log
 
-        # Resolve corpus: X-Corpus-ID takes priority over tenant lookup
+        # Resolve corpus: X-Corpus-ID is required for institute requests
         tenant_id = request.headers.get("X-Tenant-ID")
         corpus_id = request.headers.get("X-Corpus-ID")
 
-        if corpus_id:
-            with get_session() as session:
-                corpus = session.get(Corpus, corpus_id)
-                if not corpus:
-                    raise HTTPException(status_code=404, detail="corpus_not_found")
-                # Do NOT reject on tenant mismatch when X-Corpus-ID is provided
-                if tenant_id and corpus.tenant_id != tenant_id:
-                    log.warning(
-                        "tenant_mismatch_ignored_for_corpus_id",
-                        tenant_id=tenant_id,
-                        corpus_id=corpus_id,
-                        corpus_tenant_id=corpus.tenant_id,
-                    )
-        else:
-            if not tenant_id:
-                raise HTTPException(status_code=400, detail="missing_corpus_id_or_tenant_id")
-            # Legacy fallback: resolve corpus by tenant_id
-            with get_session() as session:
-                from sqlmodel import select
+        if not corpus_id:
+            raise HTTPException(status_code=400, detail="missing_corpus_id")
 
-                corpus = session.exec(
-                    select(Corpus).where(Corpus.tenant_id == tenant_id).limit(1)
-                ).first()
-
-                if not corpus:
-                    raise HTTPException(
-                        status_code=404,
-                        detail="no_corpus_found_for_tenant_please_create_corpus_first",
-                    )
-                corpus_id = corpus.id
+        with get_session() as session:
+            corpus = session.get(Corpus, corpus_id)
+            if not corpus:
+                raise HTTPException(status_code=404, detail="corpus_not_found")
+            # Do NOT reject on tenant mismatch when X-Corpus-ID is provided
+            if tenant_id and corpus.tenant_id != tenant_id:
+                log.warning(
+                    "tenant_mismatch_ignored_for_corpus_id",
+                    tenant_id=tenant_id,
+                    corpus_id=corpus_id,
+                    corpus_tenant_id=corpus.tenant_id,
+                )
         
         # PRODUCTION FLOW: Redis → DB → Background Job (NO LLM on user request)
         mapped_subject = _map_subject_name(req.subject)

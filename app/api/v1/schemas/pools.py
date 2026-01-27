@@ -23,3 +23,25 @@ class PoolResponse(BaseModel):
     questions: list[dict] | None = None
     status: Literal["ready", "ready_partial", "generating", "pending"]
     pool_info: dict[str, str] | None = None  # Pool IDs per difficulty
+
+
+PoolStatusLabel = Literal["pending", "generating", "ready", "ready_partial", "failed", "missing"]
+DifficultyLabel = Literal["easy", "medium", "hard"]
+
+
+class PoolDifficultyStatus(BaseModel):
+    status: PoolStatusLabel
+    count: int = 0
+    requested_count: int | None = None
+    generated_count: int | None = None
+    last_error: str | None = None
+
+
+class PoolStatusResponse(BaseModel):
+    corpus_id: str
+    syllabus: str
+    syllabus_version: str
+    class_level: int
+    subject: str
+    status: PoolStatusLabel
+    pools: dict[DifficultyLabel, PoolDifficultyStatus]
