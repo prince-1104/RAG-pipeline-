@@ -6,7 +6,7 @@ import uuid
 from typing import Literal
 
 from app.api.v1.schemas.generation import Blueprint, DifficultyMix, QuestionConstraints
-from app.db.models import PoolQuestion
+from app.db.models import Chunk, PoolQuestion
 from app.db.session import get_session
 from app.generation.sync import generate_questions_sync
 from app.observability.logging import log
@@ -136,13 +136,14 @@ def run_admin_generate_job(job) -> dict:
                 return None
 
             # Store questions in pool
-            pool = get_or_create_pool(syllabus, class_level, subject, difficulty, syllabus_version)
             question_ids = _store_questions_in_pool(
-                pool_id=pool.id,
                 questions=questions,
                 corpus_id=corpus_id,
                 class_level=class_level,
                 subject=subject,
+                syllabus=syllabus,
+                syllabus_version=syllabus_version,
+                difficulty=difficulty,
             )
 
             # Add to Redis
@@ -283,44 +284,74 @@ def _generate_questions_for_class(
 
 
 def _store_questions_in_pool(
-    pool_id: str,
     questions: list[dict],
     corpus_id: str,
     class_level: int,
     subject: str,
+    syllabus: str,
+    syllabus_version: str,
+    difficulty: str,
 ) -> list[str]:
-    """Store questions in PoolQuestion table and return question IDs."""
-    question_ids = []
-    
+    """Store questions in chapter pools and return question IDs."""
+    question_ids: list[str] = []
+
+    chunk_ids: set[str] = set()
+    for q in questions:
+        for cit in q.get("citations", []) or []:
+            cid = cit.get("chunk_id")
+            if cid:
+                chunk_ids.add(str(cid))
+
+    chunk_chapters: dict[str, str] = {}
+    if chunk_ids:
+        with get_session() as session:
+            rows = session.exec(
+                select(Chunk.id, Chunk.chapter).where(Chunk.id.in_(list(chunk_ids)))
+            ).all()
+        chunk_chapters = {
+            str(r[0]): (str(r[1]).strip() if r[1] else "Unknown Chapter")
+            for r in rows
+        }
+
+    questions_by_chapter: dict[str, list[dict]] = {}
+    for q in questions:
+        chapter = (q.get("tags") or {}).get("chapter")
+        if not chapter:
+            cid = (q.get("citations") or [{}])[0].get("chunk_id")
+            chapter = chunk_chapters.get(str(cid), None)
+        chapter = str(chapter).strip() if chapter else "Unknown Chapter"
+        questions_by_chapter.setdefault(chapter, []).append(q)
+
     with get_session() as session:
-        for q in questions:
-            q_id = str(uuid.uuid4())
-            question_ids.append(q_id)
-            
-            # Extract fields
-            stem = q.get("stem", "")
-            options = q.get("options") or []
-            answer = q.get("answer")
-            difficulty = q.get("difficulty", "medium")
-            citations = q.get("citations", [])
-            source_chunk_id = citations[0].get("chunk_id") if citations else None
-            tags = q.get("tags", {})
-            concept = tags.get("concept")
-            
-            pool_question = PoolQuestion(
-                id=q_id,
-                pool_id=pool_id,
-                question_text=stem,
-                options=json.dumps(options),
-                correct_answer=answer,
-                concept=concept,
-                difficulty=difficulty,
-                source_chunk_id=source_chunk_id,
-                question_json=json.dumps(q),
-            )
-            session.add(pool_question)
-        
+        for chapter, chapter_questions in questions_by_chapter.items():
+            pool = get_or_create_pool(syllabus, class_level, subject, chapter, difficulty, syllabus_version)
+            for q in chapter_questions:
+                q_id = str(uuid.uuid4())
+                question_ids.append(q_id)
+
+                # Extract fields
+                stem = q.get("stem", "")
+                options = q.get("options") or []
+                answer = q.get("answer")
+                citations = q.get("citations", [])
+                source_chunk_id = citations[0].get("chunk_id") if citations else None
+                tags = q.get("tags", {})
+                concept = tags.get("concept")
+
+                pool_question = PoolQuestion(
+                    id=q_id,
+                    pool_id=pool.id,
+                    question_text=stem,
+                    options=json.dumps(options),
+                    correct_answer=answer,
+                    concept=concept,
+                    difficulty=difficulty,
+                    source_chunk_id=source_chunk_id,
+                    question_json=json.dumps(q),
+                )
+                session.add(pool_question)
+
         session.commit()
-    
-    log.info("admin_questions_stored_in_pool", pool_id=pool_id, count=len(question_ids))
+
+    log.info("admin_questions_stored_in_pool", count=len(question_ids))
     return question_ids

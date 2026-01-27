@@ -47,6 +47,7 @@ def rebuild_redis_pool_async(pool_id: str) -> None:
                 pool.syllabus,
                 pool.class_level,
                 pool.subject,
+                pool.chapter,
                 pool.difficulty,
                 pool.syllabus_version,
             )

@@ -106,6 +106,7 @@ def run_forever() -> None:
                     syllabus=job_data["syllabus"],
                     class_level=job_data["class_level"],
                     subject=job_data["subject"],
+                    chapter=job_data.get("chapter", "Unknown Chapter"),
                     difficulty=job_data["difficulty"],
                     syllabus_version=job_data.get("syllabus_version", "2024"),
                     target_count=200,  # Generate 200 questions per pool
@@ -120,6 +121,7 @@ def run_forever() -> None:
                     syllabus=job_data["syllabus"],
                     class_level=job_data["class_level"],
                     subject=job_data["subject"],
+                    chapter=job_data.get("chapter", "Unknown Chapter"),
                     difficulty=job_data["difficulty"],
                     syllabus_version=job_data.get("syllabus_version", "2024"),
                     target_count=200,

@@ -163,6 +163,7 @@ class QuestionPool(SQLModel, table=True):
     syllabus: str = Field(index=True)  # e.g., "CBSE"
     class_level: int = Field(index=True)
     subject: str = Field(index=True)
+    chapter: str = Field(index=True, default="Unknown Chapter")
     difficulty: str = Field(index=True)  # easy | medium | hard
     syllabus_version: str = Field(index=True, default="2024")  # e.g., "2024"
     

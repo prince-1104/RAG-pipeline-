@@ -23,6 +23,7 @@ class PoolResponse(BaseModel):
     questions: list[dict] | None = None
     status: Literal["ready", "ready_partial", "generating", "pending"]
     pool_info: dict[str, str] | None = None  # Pool IDs per difficulty
+    pool_info_by_chapter: dict[str, dict[str, str]] | None = None  # Difficulty -> chapter -> pool_id
 
 
 PoolStatusLabel = Literal["pending", "generating", "ready", "ready_partial", "failed", "missing"]

@@ -5,21 +5,53 @@ import random
 from typing import Literal
 
 from app.cache.redis_client import get_redis_client
-from app.db.models import PoolQuestion, QuestionPool, QuestionPoolStatus
+from app.db.models import Chunk, PoolQuestion, QuestionPool, QuestionPoolStatus
 from app.db.session import get_session
 from app.observability.logging import log
 from sqlmodel import select
 
 
-def get_pool_key(syllabus: str, class_level: int, subject: str, difficulty: str, syllabus_version: str) -> str:
+def get_pool_key(
+    syllabus: str,
+    class_level: int,
+    subject: str,
+    chapter: str,
+    difficulty: str,
+    syllabus_version: str,
+) -> str:
     """Generate Redis key for a question pool."""
-    return f"qp:{syllabus}:{class_level}:{subject}:{difficulty}:{syllabus_version}"
+    return f"qp:{syllabus}:{class_level}:{subject}:{chapter}:{difficulty}:{syllabus_version}"
+
+
+def list_pool_chapters(corpus_id: str, class_level: int, subject: str) -> list[str]:
+    """List distinct chapters for a corpus/class/subject."""
+    with get_session() as session:
+        rows = session.exec(
+            select(Chunk.chapter).where(
+                Chunk.corpus_id == corpus_id,
+                Chunk.class_level == class_level,
+                Chunk.subject == subject,
+            )
+        ).all()
+    chapters = [str(r).strip() for r in rows if r and str(r).strip()]
+    if not chapters:
+        return ["Unknown Chapter"]
+    # Preserve insertion order, de-dup
+    seen: set[str] = set()
+    out: list[str] = []
+    for ch in chapters:
+        if ch in seen:
+            continue
+        seen.add(ch)
+        out.append(ch)
+    return out
 
 
 def get_or_create_pool(
     syllabus: str,
     class_level: int,
     subject: str,
+    chapter: str,
     difficulty: str,
     syllabus_version: str = "2024",
 ) -> QuestionPool:
@@ -30,6 +62,7 @@ def get_or_create_pool(
                 QuestionPool.syllabus == syllabus,
                 QuestionPool.class_level == class_level,
                 QuestionPool.subject == subject,
+                QuestionPool.chapter == chapter,
                 QuestionPool.difficulty == difficulty,
                 QuestionPool.syllabus_version == syllabus_version,
             )
@@ -40,6 +73,7 @@ def get_or_create_pool(
                 syllabus=syllabus,
                 class_level=class_level,
                 subject=subject,
+                chapter=chapter,
                 difficulty=difficulty,
                 syllabus_version=syllabus_version,
                 status=QuestionPoolStatus.pending,
@@ -47,7 +81,11 @@ def get_or_create_pool(
             session.add(pool)
             session.commit()
             session.refresh(pool)
-            log.info("question_pool_created", pool_id=pool.id, key=get_pool_key(syllabus, class_level, subject, difficulty, syllabus_version))
+            log.info(
+                "question_pool_created",
+                pool_id=pool.id,
+                key=get_pool_key(syllabus, class_level, subject, chapter, difficulty, syllabus_version),
+            )
         
         return pool
 
@@ -56,6 +94,7 @@ def get_pool_status(
     syllabus: str,
     class_level: int,
     subject: str,
+    chapter: str,
     difficulty: str,
     syllabus_version: str = "2024",
 ) -> QuestionPoolStatus | None:
@@ -66,6 +105,7 @@ def get_pool_status(
                 QuestionPool.syllabus == syllabus,
                 QuestionPool.class_level == class_level,
                 QuestionPool.subject == subject,
+                QuestionPool.chapter == chapter,
                 QuestionPool.difficulty == difficulty,
                 QuestionPool.syllabus_version == syllabus_version,
             )
@@ -77,6 +117,7 @@ def get_questions_from_pool(
     syllabus: str,
     class_level: int,
     subject: str,
+    chapter: str,
     difficulty: str,
     syllabus_version: str,
     count: int,
@@ -86,10 +127,10 @@ def get_questions_from_pool(
     Returns empty list if pool is not ready or insufficient questions.
     """
     redis_client = get_redis_client()
-    pool_key = get_pool_key(syllabus, class_level, subject, difficulty, syllabus_version)
+    pool_key = get_pool_key(syllabus, class_level, subject, chapter, difficulty, syllabus_version)
     
     # Check if pool exists and is ready
-    pool_status = get_pool_status(syllabus, class_level, subject, difficulty, syllabus_version)
+    pool_status = get_pool_status(syllabus, class_level, subject, chapter, difficulty, syllabus_version)
     if pool_status not in (QuestionPoolStatus.ready, QuestionPoolStatus.ready_partial):
         log.warning("pool_not_ready", pool_key=pool_key, status=pool_status)
         return []
@@ -141,6 +182,7 @@ def add_questions_to_pool(
             pool.syllabus,
             pool.class_level,
             pool.subject,
+            pool.chapter,
             pool.difficulty,
             pool.syllabus_version,
         )

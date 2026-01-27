@@ -413,6 +413,7 @@ def get_pool_status_endpoint(
     subject: str,
     syllabus: str = "CBSE",
     syllabus_version: str = "2024",
+    chapter: str | None = None,
 ):
     """
     Read-only pool status endpoint.
@@ -423,7 +424,7 @@ def get_pool_status_endpoint(
 
     from app.cache.redis_client import get_redis_client
     from app.db.models import PoolQuestion, QuestionPool, QuestionPoolStatus
-    from app.pools.service import get_pool_key
+    from app.pools.service import get_pool_key, list_pool_chapters
 
     tenant_id = request.headers.get("X-Tenant-ID")
     corpus_id = request.headers.get("X-Corpus-ID")
@@ -447,44 +448,72 @@ def get_pool_status_endpoint(
     mapped_subject = _map_subject_name(subject)
     redis_client = get_redis_client()
 
+    chapters = [chapter] if chapter else list_pool_chapters(corpus_id, class_level, mapped_subject)
     pools: dict[str, PoolDifficultyStatus] = {}
     statuses: list[str] = []
 
     with get_session() as session:
         for difficulty in ["easy", "medium", "hard"]:
-            pool = session.exec(
-                select(QuestionPool).where(
-                    QuestionPool.syllabus == syllabus,
-                    QuestionPool.class_level == class_level,
-                    QuestionPool.subject == mapped_subject,
-                    QuestionPool.difficulty == difficulty,
-                    QuestionPool.syllabus_version == syllabus_version,
-                )
-            ).first()
+            status_bucket: list[str] = []
+            count_total = 0
+            requested_total = 0
+            generated_total = 0
+            last_error: str | None = None
 
-            if not pool:
-                pools[difficulty] = PoolDifficultyStatus(status="missing", count=0)
-                statuses.append("missing")
-                continue
+            for ch in chapters:
+                pool = session.exec(
+                    select(QuestionPool).where(
+                        QuestionPool.syllabus == syllabus,
+                        QuestionPool.class_level == class_level,
+                        QuestionPool.subject == mapped_subject,
+                        QuestionPool.chapter == ch,
+                        QuestionPool.difficulty == difficulty,
+                        QuestionPool.syllabus_version == syllabus_version,
+                    )
+                ).first()
 
-            pool_status = pool.status.value if isinstance(pool.status, QuestionPoolStatus) else str(pool.status)
-            pool_key = get_pool_key(syllabus, class_level, mapped_subject, difficulty, syllabus_version)
-            redis_count = int(redis_client.llen(pool_key))
+                if not pool:
+                    status_bucket.append("missing")
+                    continue
 
-            if redis_count == 0:
-                redis_count = int(
-                    session.exec(
-                        select(func.count(PoolQuestion.id)).where(PoolQuestion.pool_id == pool.id)
-                    ).one()
-                    or 0
-                )
+                pool_status = pool.status.value if isinstance(pool.status, QuestionPoolStatus) else str(pool.status)
+                status_bucket.append(pool_status)
+                pool_key = get_pool_key(syllabus, class_level, mapped_subject, ch, difficulty, syllabus_version)
+                redis_count = int(redis_client.llen(pool_key))
+
+                if redis_count == 0:
+                    redis_count = int(
+                        session.exec(
+                            select(func.count(PoolQuestion.id)).where(PoolQuestion.pool_id == pool.id)
+                        ).one()
+                        or 0
+                    )
+                count_total += redis_count
+
+                if pool.requested_count is not None:
+                    requested_total += int(pool.requested_count)
+                if pool.generated_count is not None:
+                    generated_total += int(pool.generated_count)
+                if pool.last_error and not last_error:
+                    last_error = pool.last_error
+
+            if any(status == "failed" for status in status_bucket):
+                pool_status = "failed"
+            elif any(status == "generating" for status in status_bucket):
+                pool_status = "generating"
+            elif any(status in ("pending", "missing") for status in status_bucket):
+                pool_status = "pending"
+            elif any(status == "ready_partial" for status in status_bucket):
+                pool_status = "ready_partial"
+            else:
+                pool_status = "ready"
 
             pools[difficulty] = PoolDifficultyStatus(
                 status=pool_status,  # type: ignore[arg-type]
-                count=redis_count,
-                requested_count=pool.requested_count,
-                generated_count=pool.generated_count,
-                last_error=pool.last_error,
+                count=count_total,
+                requested_count=requested_total or None,
+                generated_count=generated_total or None,
+                last_error=last_error,
             )
             statuses.append(pool_status)
 
@@ -492,7 +521,7 @@ def get_pool_status_endpoint(
         overall_status = "failed"
     elif any(status == "generating" for status in statuses):
         overall_status = "generating"
-    elif any(status in ("pending", "missing") for status in statuses):
+    elif any(status == "pending" for status in statuses):
         overall_status = "pending"
     elif any(status == "ready_partial" for status in statuses):
         overall_status = "ready_partial"
@@ -517,6 +546,7 @@ def _trigger_pool_generation(
     subject: str,
     difficulty: str,
     syllabus_version: str,
+    chapters: list[str],
 ) -> None:
     """Trigger background job to generate question pool (LLM called in worker)."""
     import json
@@ -535,7 +565,7 @@ def _trigger_pool_generation(
             )
         ).all()
         
-        # Check if there's already a queued/running job for this exact pool
+        queued: set[str] = set()
         for job in existing_jobs:
             if job.status in [JobStatus.queued, JobStatus.running]:
                 try:
@@ -545,33 +575,38 @@ def _trigger_pool_generation(
                         job_data.get("subject") == subject and
                         job_data.get("difficulty") == difficulty and
                         job_data.get("syllabus_version") == syllabus_version):
-                        log.info("pool_generation_job_already_queued", job_id=job.id)
-                        return
+                        queued.add(job_data.get("chapter") or "Unknown Chapter")
                 except Exception:
                     continue
         
-        # Create new background pool generation job
-        job_data = {
-            "corpus_id": corpus_id,
-            "syllabus": syllabus,
-            "class_level": class_level,
-            "subject": subject,
-            "difficulty": difficulty,
-            "syllabus_version": syllabus_version,
-        }
-        
-        # Create job - use enum value directly to avoid SQLAlchemy serialization issues
-        # SQLAlchemy with native_enum=False should use enum.value, but we'll ensure it explicitly
-        job = GenerationJob(
-            kind=JobKind.generate_question_pool,
-            status=JobStatus.queued,
-            tenant_id="system",
-            corpus_id=corpus_id,
-            request_json=json.dumps(job_data),
-        )
-        session.add(job)
-        session.commit()
-        log.info("pool_generation_job_created", job_id=job.id, difficulty=difficulty)
+        created = 0
+        for chapter in chapters:
+            if chapter in queued:
+                continue
+            job_data = {
+                "corpus_id": corpus_id,
+                "syllabus": syllabus,
+                "class_level": class_level,
+                "subject": subject,
+                "chapter": chapter,
+                "difficulty": difficulty,
+                "syllabus_version": syllabus_version,
+            }
+
+            # Create job - use enum value directly to avoid SQLAlchemy serialization issues
+            # SQLAlchemy with native_enum=False should use enum.value, but we'll ensure it explicitly
+            job = GenerationJob(
+                kind=JobKind.generate_question_pool,
+                status=JobStatus.queued,
+                tenant_id="system",
+                corpus_id=corpus_id,
+                request_json=json.dumps(job_data),
+            )
+            session.add(job)
+            created += 1
+        if created:
+            session.commit()
+            log.info("pool_generation_jobs_created", difficulty=difficulty, count=created)
 
 
 def _convert_response_to_niyukti_format(
@@ -690,69 +725,98 @@ def _generate_questions_niyukti_impl(request: Request, req: NiyuktiGenerateReque
         # STEP A: Check Redis (hot path)
         all_questions = []
         pool_info = {}
+        pool_info_by_chapter: dict[str, dict[str, str]] = {}
         needs_generation = False
+        chapters = None
         
         for difficulty, count in difficulty_mix.items():
             if count <= 0:
                 continue
             
             # Try to get questions from Redis pool
-            from app.pools.service import get_questions_from_pool, get_pool_status, get_or_create_pool
-            
-            redis_questions = get_questions_from_pool(
-                syllabus=syllabus,
-                class_level=req.class_level,
-                subject=mapped_subject,
-                difficulty=difficulty,
-                syllabus_version=syllabus_version,
-                count=count,
+            from app.pools.service import (
+                get_questions_from_pool,
+                get_pool_status,
+                get_or_create_pool,
+                list_pool_chapters,
             )
+
+            if chapters is None:
+                chapters = list_pool_chapters(corpus_id, req.class_level, mapped_subject)
+            pool_info_by_chapter[difficulty] = {}
+
+            count_remaining = count
+            for chapter in chapters:
+                pool = get_or_create_pool(
+                    syllabus,
+                    req.class_level,
+                    mapped_subject,
+                    chapter,
+                    difficulty,
+                    syllabus_version,
+                )
+                pool_info_by_chapter[difficulty][chapter] = pool.id
             
-            if len(redis_questions) >= count:
-                # STEP A SUCCESS: Redis has questions
-                pool = get_or_create_pool(syllabus, req.class_level, mapped_subject, difficulty, syllabus_version)
-                pool_info[difficulty] = pool.id
-                
-                # Convert PoolQuestion to Niyukti format
-                for pq in redis_questions[:count]:
-                    q_data = json.loads(pq.question_json)
-                    all_questions.append(q_data)
-            else:
-                # STEP B: Check DB (cold but safe)
-                pool_status = get_pool_status(syllabus, req.class_level, mapped_subject, difficulty, syllabus_version)
-                
+            for chapter in chapters:
+                if count_remaining <= 0:
+                    break
+                redis_questions = get_questions_from_pool(
+                    syllabus=syllabus,
+                    class_level=req.class_level,
+                    subject=mapped_subject,
+                    chapter=chapter,
+                    difficulty=difficulty,
+                    syllabus_version=syllabus_version,
+                    count=count_remaining,
+                )
+                if redis_questions:
+                    for pq in redis_questions:
+                        q_data = json.loads(pq.question_json)
+                        all_questions.append(q_data)
+                    count_remaining -= len(redis_questions)
+
+            if count_remaining <= 0:
+                pool_info[difficulty] = next(iter(pool_info_by_chapter[difficulty].values()))
+                continue
+
+            # STEP B: Check DB (cold but safe)
+            for chapter in chapters:
+                if count_remaining <= 0:
+                    break
+                pool_status = get_pool_status(syllabus, req.class_level, mapped_subject, chapter, difficulty, syllabus_version)
+
                 if pool_status == "ready":
-                    # DB has active pool but Redis is empty - rebuild Redis async
-                    pool = get_or_create_pool(syllabus, req.class_level, mapped_subject, difficulty, syllabus_version)
+                    pool = get_or_create_pool(syllabus, req.class_level, mapped_subject, chapter, difficulty, syllabus_version)
                     pool_info[difficulty] = pool.id
-                    
+
                     # Trigger async Redis rebuild
                     from app.pools.rebuild import rebuild_redis_pool_async
                     import threading
                     threading.Thread(target=rebuild_redis_pool_async, args=(pool.id,), daemon=True).start()
-                    
+
                     # Fetch from DB while Redis rebuilds
                     from sqlmodel import select
                     from app.db.models import PoolQuestion
-                    
+
                     with get_session() as session:
                         db_questions = session.exec(
                             select(PoolQuestion)
                             .where(PoolQuestion.pool_id == pool.id)
-                            .limit(count)
+                            .limit(count_remaining)
                         ).all()
-                        
-                        for pq in db_questions[:count]:
+
+                        for pq in db_questions[:count_remaining]:
                             q_data = json.loads(pq.question_json)
                             all_questions.append(q_data)
-                else:
-                    # STEP C: Trigger background job (ONLY enqueue)
-                    needs_generation = True
-                    pool = get_or_create_pool(syllabus, req.class_level, mapped_subject, difficulty, syllabus_version)
-                    pool_info[difficulty] = pool.id
-                    
-                    # Trigger background pool generation
-                    _trigger_pool_generation(corpus_id, syllabus, req.class_level, mapped_subject, difficulty, syllabus_version)
+                        count_remaining -= len(db_questions)
+
+            if count_remaining > 0:
+                # STEP C: Trigger background job (ONLY enqueue)
+                needs_generation = True
+                pool_info[difficulty] = next(iter(pool_info_by_chapter[difficulty].values()))
+
+                # Trigger background pool generation
+                _trigger_pool_generation(corpus_id, syllabus, req.class_level, mapped_subject, difficulty, syllabus_version, chapters)
         
         # Return response
         if all_questions and not needs_generation:
@@ -770,6 +834,7 @@ def _generate_questions_niyukti_impl(request: Request, req: NiyuktiGenerateReque
                     "status": "generating",
                     "message": "questions_are_being_generated_please_check_back_shortly",
                     "pool_info": pool_info,
+                    "pool_info_by_chapter": pool_info_by_chapter,
                     "corpus_id": corpus_id,
                     "class_level": req.class_level,
                     "subject": req.subject,

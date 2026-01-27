@@ -222,6 +222,46 @@ def migrate_add_question_pool_bookkeeping_fields() -> None:
             raise
 
 
+def migrate_add_question_pool_chapter() -> None:
+    """
+    Add chapter column to questionpool table if missing.
+    Idempotent.
+    """
+    engine = get_engine()
+    with Session(engine) as session:
+        try:
+            result = session.exec(
+                text(
+                    """
+                    SELECT column_name
+                    FROM information_schema.columns
+                    WHERE table_name = 'questionpool'
+                    AND column_name = 'chapter'
+                    """
+                )
+            ).all()
+            existing_columns = {row[0] for row in result}
+
+            if "chapter" not in existing_columns:
+                session.exec(
+                    text(
+                        """
+                        ALTER TABLE questionpool
+                        ADD COLUMN chapter VARCHAR NOT NULL DEFAULT 'Unknown Chapter'
+                        """
+                    )
+                )
+                session.exec(text("CREATE INDEX IF NOT EXISTS ix_questionpool_chapter ON questionpool(chapter)"))
+                session.commit()
+                log.info("migration_column_added", table="questionpool", column="chapter")
+            else:
+                log.info("migration_column_exists", table="questionpool", column="chapter")
+        except Exception as e:
+            session.rollback()
+            log.exception("migration_error", error=str(e))
+            raise
+
+
 def run_all_migrations() -> None:
     """Run all pending migrations."""
     log.info("migrations_starting")
@@ -229,6 +269,7 @@ def run_all_migrations() -> None:
     migrate_add_job_kind_admin_generate_questions()
     migrate_add_question_pool_status_ready_partial()
     migrate_add_question_pool_bookkeeping_fields()
+    migrate_add_question_pool_chapter()
     log.info("migrations_complete")
 
 

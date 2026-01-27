@@ -166,6 +166,7 @@ def generate_question_pool(
     syllabus: str,
     class_level: int,
     subject: str,
+    chapter: str,
     difficulty: Literal["easy", "medium", "hard"],
     syllabus_version: str = "2024",
     target_count: int = 200,  # Generate 200 questions per pool
@@ -183,7 +184,7 @@ def generate_question_pool(
     7. Mark pool as READY
     """
     # Step 1: Get or create pool
-    pool = get_or_create_pool(syllabus, class_level, subject, difficulty, syllabus_version)
+    pool = get_or_create_pool(syllabus, class_level, subject, chapter, difficulty, syllabus_version)
     
     # If fully ready, no work to do.
     if pool.status == QuestionPoolStatus.ready:
@@ -203,14 +204,14 @@ def generate_question_pool(
 
         # Step 2: Retrieve top 5-8 chunks (STRICT LIMIT)
         top_k = max(3, int(getattr(s, "pool_generation_context_chunks", 6) or 6))
-        query = f"{syllabus} {subject} class {class_level} syllabus version {syllabus_version}"
+        query = f"{syllabus} {subject} class {class_level} chapter {chapter} syllabus version {syllabus_version}"
         
         # Use a generic query that retrieves diverse content
         rr = retrieve(
             corpus_id=corpus_id,
             class_level=class_level,
             subject=subject,
-            chapters=["Unknown Chapter"],  # Get all chapters for pool generation
+            chapters=[chapter],
             query=query,
             top_k=top_k,
         )

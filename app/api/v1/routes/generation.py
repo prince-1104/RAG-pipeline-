@@ -15,6 +15,7 @@ from app.pools.service import (
     get_or_create_pool,
     get_pool_status,
     get_questions_from_pool,
+    list_pool_chapters,
 )
 
 
@@ -96,93 +97,93 @@ def serve_from_pool(request: Request, req: PoolRequest):
         if corpus.tenant_id != req.tenant_id:
             raise HTTPException(status_code=403, detail="tenant_mismatch")
     
+    chapters = list_pool_chapters(req.corpus_id, req.class_level, req.subject)
+
     # Check each difficulty pool
     all_questions = []
     pool_info = {}
+    pool_info_by_chapter: dict[str, dict[str, str]] = {}
     overall_status = "ready"
     
     for difficulty, count in req.difficulty_mix.items():
         if count <= 0:
             continue
         
-        # Get or create pool
-        pool = get_or_create_pool(
-            syllabus=req.syllabus,
-            class_level=req.class_level,
-            subject=req.subject,
-            difficulty=difficulty,
-            syllabus_version=req.syllabus_version,
-        )
-        pool_info[difficulty] = pool.id
-        
-        pool_status = get_pool_status(
-            syllabus=req.syllabus,
-            class_level=req.class_level,
-            subject=req.subject,
-            difficulty=difficulty,
-            syllabus_version=req.syllabus_version,
-        )
-        
-        if pool_status in (QuestionPoolStatus.ready, QuestionPoolStatus.ready_partial):
-            # Fast path: fetch from Redis
-            questions = get_questions_from_pool(
+        pool_info_by_chapter[difficulty] = {}
+        pool_statuses: list[str] = []
+        count_remaining = count
+
+        for chapter in chapters:
+            pool = get_or_create_pool(
                 syllabus=req.syllabus,
                 class_level=req.class_level,
                 subject=req.subject,
+                chapter=chapter,
                 difficulty=difficulty,
                 syllabus_version=req.syllabus_version,
-                count=count,
             )
-            
-            if len(questions) >= count:
-                # Convert PoolQuestion to GeneratedQuestionOut format
-                for pq in questions[:count]:
-                    q_data = json.loads(pq.question_json)
-                    all_questions.append(q_data)
-            else:
-                # Partial/insufficient: return what we have and trigger backfill
+            pool_info_by_chapter[difficulty][chapter] = pool.id
+
+            pool_status = get_pool_status(
+                syllabus=req.syllabus,
+                class_level=req.class_level,
+                subject=req.subject,
+                chapter=chapter,
+                difficulty=difficulty,
+                syllabus_version=req.syllabus_version,
+            )
+            pool_statuses.append(pool_status.value if pool_status else "pending")
+
+        for chapter in chapters:
+            if count_remaining <= 0:
+                break
+            pool_status = get_pool_status(
+                syllabus=req.syllabus,
+                class_level=req.class_level,
+                subject=req.subject,
+                chapter=chapter,
+                difficulty=difficulty,
+                syllabus_version=req.syllabus_version,
+            )
+            if pool_status in (QuestionPoolStatus.ready, QuestionPoolStatus.ready_partial):
+                questions = get_questions_from_pool(
+                    syllabus=req.syllabus,
+                    class_level=req.class_level,
+                    subject=req.subject,
+                    chapter=chapter,
+                    difficulty=difficulty,
+                    syllabus_version=req.syllabus_version,
+                    count=count_remaining,
+                )
                 if questions:
                     for pq in questions:
                         q_data = json.loads(pq.question_json)
                         all_questions.append(q_data)
-                    overall_status = "ready_partial"
-                else:
-                    overall_status = "generating"
-                _trigger_pool_generation(
-                    corpus_id=req.corpus_id,
-                    syllabus=req.syllabus,
-                    class_level=req.class_level,
-                    subject=req.subject,
-                    difficulty=difficulty,
-                    syllabus_version=req.syllabus_version,
-                )
-        
-        elif pool_status == QuestionPoolStatus.generating:
+                    count_remaining -= len(questions)
+
+        if count_remaining <= 0:
+            pool_info[difficulty] = next(iter(pool_info_by_chapter[difficulty].values()))
+            continue
+
+        if any(status == QuestionPoolStatus.generating.value for status in pool_statuses):
             overall_status = "generating"
-        
-        elif pool_status == QuestionPoolStatus.pending or pool_status is None:
-            # Trigger generation
+        elif any(status == QuestionPoolStatus.pending.value for status in pool_statuses):
             overall_status = "generating"
-            _trigger_pool_generation(
-                corpus_id=req.corpus_id,
-                syllabus=req.syllabus,
-                class_level=req.class_level,
-                subject=req.subject,
-                difficulty=difficulty,
-                syllabus_version=req.syllabus_version,
-            )
-        
-        elif pool_status == QuestionPoolStatus.failed:
-            # Retry failed pool
+        elif any(status == QuestionPoolStatus.failed.value for status in pool_statuses):
             overall_status = "generating"
-            _trigger_pool_generation(
-                corpus_id=req.corpus_id,
-                syllabus=req.syllabus,
-                class_level=req.class_level,
-                subject=req.subject,
-                difficulty=difficulty,
-                syllabus_version=req.syllabus_version,
-            )
+        elif any(status == QuestionPoolStatus.ready_partial.value for status in pool_statuses):
+            overall_status = "ready_partial"
+
+        _trigger_pool_generation(
+            corpus_id=req.corpus_id,
+            syllabus=req.syllabus,
+            class_level=req.class_level,
+            subject=req.subject,
+            difficulty=difficulty,
+            syllabus_version=req.syllabus_version,
+            chapters=chapters,
+        )
+        pool_info[difficulty] = next(iter(pool_info_by_chapter[difficulty].values()))
     
     # Return response
     if overall_status in ("ready", "ready_partial") and all_questions:
@@ -190,6 +191,7 @@ def serve_from_pool(request: Request, req: PoolRequest):
             questions=all_questions,
             status=overall_status,
             pool_info=pool_info,
+            pool_info_by_chapter=pool_info_by_chapter,
         )
     else:
         # Return 202 Accepted - pool is generating
@@ -197,6 +199,7 @@ def serve_from_pool(request: Request, req: PoolRequest):
             questions=None,
             status="generating",
             pool_info=pool_info,
+            pool_info_by_chapter=pool_info_by_chapter,
         )
 
 
@@ -207,6 +210,7 @@ def _trigger_pool_generation(
     subject: str,
     difficulty: str,
     syllabus_version: str,
+    chapters: list[str],
 ) -> None:
     """Trigger background job to generate question pool."""
     with get_session() as session:
@@ -219,6 +223,7 @@ def _trigger_pool_generation(
         ).all()
         
         # Check if there's already a queued/running job for this exact pool
+        queued: set[tuple[str, str]] = set()
         for job in existing_jobs:
             if job.status in [JobStatus.queued, JobStatus.running]:
                 try:
@@ -228,30 +233,34 @@ def _trigger_pool_generation(
                         job_data.get("subject") == subject and
                         job_data.get("difficulty") == difficulty and
                         job_data.get("syllabus_version") == syllabus_version):
-                        log.info("pool_generation_job_already_queued", job_id=job.id)
-                        return
+                        queued.add((job_data.get("chapter") or "Unknown Chapter", job.id))
                 except Exception:
                     continue
         
-        # Create new job
-        job_data = {
-            "corpus_id": corpus_id,
-            "syllabus": syllabus,
-            "class_level": class_level,
-            "subject": subject,
-            "difficulty": difficulty,
-            "syllabus_version": syllabus_version,
-        }
-        
-        job = GenerationJob(
-            kind=JobKind.generate_question_pool,
-            status=JobStatus.queued,
-            tenant_id="system",  # System-level job
-            corpus_id=corpus_id,
-            request_json=json.dumps(job_data),
-        )
-        session.add(job)
-        session.commit()
-        log.info("pool_generation_job_created", job_id=job.id, difficulty=difficulty)
+        created = 0
+        for chapter in chapters:
+            if any(chapter == c for c, _ in queued):
+                continue
+            job_data = {
+                "corpus_id": corpus_id,
+                "syllabus": syllabus,
+                "class_level": class_level,
+                "subject": subject,
+                "chapter": chapter,
+                "difficulty": difficulty,
+                "syllabus_version": syllabus_version,
+            }
+            job = GenerationJob(
+                kind=JobKind.generate_question_pool,
+                status=JobStatus.queued,
+                tenant_id="system",  # System-level job
+                corpus_id=corpus_id,
+                request_json=json.dumps(job_data),
+            )
+            session.add(job)
+            created += 1
+        if created:
+            session.commit()
+            log.info("pool_generation_jobs_created", difficulty=difficulty, count=created)
 
 
