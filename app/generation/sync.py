@@ -43,26 +43,7 @@ def generate_questions_sync(req: GenerateRequest) -> GenerateResponse:
         query=query,
         top_k=top_k,
     )
-    # #region agent log
-    try:
-        import json
-        from app.debug_log import DEBUG_LOG_PATH, ensure_log_dir
-        ensure_log_dir()
-        with open(DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"D","location":"sync.py:45","message":"Retrieval result","data":{"confidence":rr.confidence,"chunks_count":len(rr.chunks),"min_threshold":s.min_retrieval_confidence,"will_raise_409":rr.confidence<s.min_retrieval_confidence,"subject":bp.constraints.subject,"class_level":bp.constraints.class_level},"timestamp":int(__import__("time").time()*1000)})+"\n")
-    except Exception:
-        pass
-    # #endregion
     if rr.confidence < s.min_retrieval_confidence:
-        # #region agent log
-        try:
-            import json
-            from app.debug_log import DEBUG_LOG_PATH
-            with open(DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
-                f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"D","location":"sync.py:47","message":"Raising 409 low_retrieval_confidence","data":{"confidence":rr.confidence,"threshold":s.min_retrieval_confidence},"timestamp":int(__import__("time").time()*1000)})+"\n")
-        except Exception:
-            pass
-        # #endregion
         raise HTTPException(status_code=409, detail="low_retrieval_confidence")
 
     doc_uri = _document_uri_map(req.corpus_id)

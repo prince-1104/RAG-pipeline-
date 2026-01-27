@@ -16,10 +16,22 @@ class OpenRouterClient:
     through a unified API.
     """
 
-    def __init__(self, *, api_key: str, model: str, base_url: str | None = None):
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        model: str,
+        base_url: str | None = None,
+        timeout_s: float = 60.0,
+        temperature: float = 0.2,
+        max_tokens: int = 4096,
+    ):
         self.api_key = api_key
         self.model = model
         self.base_url = base_url or "https://openrouter.ai/api/v1"
+        self.timeout_s = timeout_s
+        self.temperature = temperature
+        self.max_tokens = max_tokens
 
     def generate_json(self, *, system_prompt: str, user_prompt: str, json_schema: dict[str, Any]) -> LLMResult:
         """
@@ -49,8 +61,8 @@ class OpenRouterClient:
                 {"role": "system", "content": enhanced_system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-            "temperature": 0.2,
-            "max_tokens": 4096,
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
             "response_format": {"type": "json_object"},  # Force JSON output
         }
 
@@ -59,7 +71,7 @@ class OpenRouterClient:
         last_resp_text: str | None = None
 
         try:
-            with httpx.Client(timeout=60) as client:
+            with httpx.Client(timeout=self.timeout_s) as client:
                 resp = client.post(url, headers=headers, json=payload)
                 last_status = resp.status_code
                 last_resp_text = resp.text

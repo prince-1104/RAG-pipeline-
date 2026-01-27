@@ -21,5 +21,5 @@ class PoolRequest(BaseModel):
 class PoolResponse(BaseModel):
     """Response from pool-based question serving."""
     questions: list[dict] | None = None
-    status: Literal["ready", "generating", "pending"]
+    status: Literal["ready", "ready_partial", "generating", "pending"]
     pool_info: dict[str, str] | None = None  # Pool IDs per difficulty

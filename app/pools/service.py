@@ -90,15 +90,19 @@ def get_questions_from_pool(
     
     # Check if pool exists and is ready
     pool_status = get_pool_status(syllabus, class_level, subject, difficulty, syllabus_version)
-    if pool_status != QuestionPoolStatus.ready:
+    if pool_status not in (QuestionPoolStatus.ready, QuestionPoolStatus.ready_partial):
         log.warning("pool_not_ready", pool_key=pool_key, status=pool_status)
         return []
     
     # Get question IDs from Redis (pre-shuffled list)
     question_ids = redis_client.lrange(pool_key, 0, count - 1)
-    
-    if len(question_ids) < count:
-        log.warning("pool_insufficient_questions", pool_key=pool_key, requested=count, available=len(question_ids))
+    available = len(question_ids)
+    if available < count and pool_status == QuestionPoolStatus.ready:
+        # strict for fully-ready pools (should have enough); trigger refresh upstream
+        log.warning("pool_insufficient_questions", pool_key=pool_key, requested=count, available=available)
+        return []
+    if available == 0:
+        log.warning("pool_empty", pool_key=pool_key)
         return []
     
     # Fetch questions from database
@@ -108,7 +112,7 @@ def get_questions_from_pool(
         ).all()
         
         # Remove fetched IDs from Redis (pop from left)
-        redis_client.ltrim(pool_key, count, -1)
+        redis_client.ltrim(pool_key, min(count, available), -1)
         
         log.info("questions_fetched_from_pool", pool_key=pool_key, count=len(questions))
         return list(questions)
@@ -117,6 +121,11 @@ def get_questions_from_pool(
 def add_questions_to_pool(
     pool_id: str,
     question_ids: list[str],
+    *,
+    requested_count: int | None = None,
+    generated_count: int | None = None,
+    status: QuestionPoolStatus | None = None,
+    last_error: str | None = None,
 ) -> None:
     """
     Add question IDs to Redis pool list (pre-shuffled).
@@ -148,8 +157,14 @@ def add_questions_to_pool(
             redis_client.expire(pool_key, 30 * 24 * 60 * 60)
             log.info("questions_added_to_pool", pool_key=pool_key, count=len(shuffled_ids))
         
-        # Update pool status to ready
-        pool.status = QuestionPoolStatus.ready
+        # Update pool status (default: ready)
+        pool.status = status or QuestionPoolStatus.ready
+        if requested_count is not None:
+            pool.requested_count = requested_count
+        if generated_count is not None:
+            pool.generated_count = generated_count
+        if last_error is not None:
+            pool.last_error = last_error
         session.add(pool)
         session.commit()
 
@@ -170,6 +185,20 @@ def mark_pool_failed(pool_id: str, error_message: str | None = None) -> None:
         pool = session.get(QuestionPool, pool_id)
         if pool:
             pool.status = QuestionPoolStatus.failed
+            pool.last_error = error_message
             session.add(pool)
             session.commit()
             log.error("pool_generation_failed", pool_id=pool_id, error=error_message)
+
+
+def mark_pool_ready_partial(pool_id: str, *, requested_count: int, generated_count: int, last_error: str | None = None) -> None:
+    """Mark pool as ready_partial and persist counts."""
+    with get_session() as session:
+        pool = session.get(QuestionPool, pool_id)
+        if pool:
+            pool.status = QuestionPoolStatus.ready_partial
+            pool.requested_count = requested_count
+            pool.generated_count = generated_count
+            pool.last_error = last_error
+            session.add(pool)
+            session.commit()

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import uuid
 from typing import Literal
@@ -65,8 +66,12 @@ def run_admin_generate_job(job) -> dict:
     total_questions_generated = 0
     pools_updated = []
     
-    # Generate questions for each class in the range
-    for class_level in range(from_class, to_class + 1):
+    settings = get_settings()
+    max_workers = max(1, int(getattr(settings, "admin_generate_max_concurrency", 2) or 2))
+    classes_in_range = to_class - from_class + 1
+    questions_per_class = max(1, question_count // classes_in_range)
+
+    def _run_for_class(class_level: int) -> dict | None:
         try:
             # Determine chapters to use
             chapters_to_use = chapters
@@ -74,6 +79,7 @@ def run_admin_generate_job(job) -> dict:
                 # Auto-detect chapters from chunks
                 with get_session() as session:
                     from app.db.models import Chunk
+
                     chunk_rows = session.exec(
                         select(Chunk.chapter)
                         .where(
@@ -84,14 +90,10 @@ def run_admin_generate_job(job) -> dict:
                         .distinct()
                     ).all()
                     chapters_to_use = [str(c).strip() for c in chunk_rows if c and str(c).strip()]
-            
+
             if not chapters_to_use:
                 chapters_to_use = ["Unknown Chapter"]
-            
-            # Calculate questions per class (distribute evenly)
-            classes_in_range = to_class - from_class + 1
-            questions_per_class = max(1, question_count // classes_in_range)
-            
+
             # Generate questions for this class
             questions = _generate_questions_for_class(
                 corpus_id=corpus_id,
@@ -103,15 +105,15 @@ def run_admin_generate_job(job) -> dict:
                 chapters=chapters_to_use,
                 count=questions_per_class,
             )
-            
+
             if not questions:
                 log.warning(
                     "no_questions_generated_for_class",
                     job_id=job.id,
                     class_level=class_level,
                 )
-                continue
-            
+                return None
+
             # Store questions in pool
             pool = get_or_create_pool(syllabus, class_level, subject, difficulty, syllabus_version)
             question_ids = _store_questions_in_pool(
@@ -121,17 +123,10 @@ def run_admin_generate_job(job) -> dict:
                 class_level=class_level,
                 subject=subject,
             )
-            
+
             # Add to Redis
             add_questions_to_pool(pool.id, question_ids)
-            pools_updated.append({
-                "pool_id": pool.id,
-                "class_level": class_level,
-                "question_count": len(question_ids),
-            })
-            
-            total_questions_generated += len(question_ids)
-            
+
             log.info(
                 "admin_questions_generated_for_class",
                 job_id=job.id,
@@ -139,16 +134,38 @@ def run_admin_generate_job(job) -> dict:
                 question_count=len(question_ids),
                 pool_id=pool.id,
             )
-            
-        except Exception as e:
+
+            return {
+                "pool_id": pool.id,
+                "class_level": class_level,
+                "question_count": len(question_ids),
+            }
+        except Exception as e:  # noqa: BLE001
             log.exception(
                 "admin_generate_failed_for_class",
                 job_id=job.id,
                 class_level=class_level,
                 error=str(e),
             )
-            # Continue with other classes
-            continue
+            return None
+
+    class_levels = list(range(from_class, to_class + 1))
+    log.info(
+        "admin_generate_parallel_start",
+        job_id=job.id,
+        classes=class_levels,
+        questions_per_class=questions_per_class,
+        max_workers=max_workers,
+    )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(_run_for_class, cl): cl for cl in class_levels}
+        for future in concurrent.futures.as_completed(futures.keys()):
+            res = future.result()
+            if not res:
+                continue
+            pools_updated.append(res)
+            total_questions_generated += int(res["question_count"])
     
     result = {
         "ok": True,

@@ -49,6 +49,11 @@ class Settings(BaseSettings):
     gemini_api_key: str | None = None
     gemini_model: str = "gemini-2.5-flash"  # Updated to newer model; falls back to stub if unavailable
     
+    # OpenAI (direct) configuration
+    openai_api_key: str | None = None
+    openai_model: str = "gpt-4o-mini"
+    openai_base_url: str | None = None  # Optional; defaults to https://api.openai.com/v1
+
     # OpenRouter configuration (unified API for multiple LLM providers)
     openrouter_api_key: str | None = None
     openrouter_model: str = "openai/gpt-4o-mini"  # Default: cost-effective OpenAI model via OpenRouter
@@ -63,6 +68,24 @@ class Settings(BaseSettings):
     requests_per_minute: int = 120
     max_context_chunks: int = 12
     min_retrieval_confidence: float = 0.55
+
+    # LLM performance tuning
+    llm_timeout_s: float = 90.0
+    llm_temperature: float = 0.2
+    llm_max_tokens: int = 4096
+
+    # Pool generation performance tuning
+    pool_generation_max_concurrency: int = 6
+    pool_generation_context_chunks: int = 6
+    pool_generation_chunk_chars: int = 900
+    pool_generation_min_absolute: int = 10
+    pool_generation_min_fraction: float = 0.2
+
+    # Admin generation performance tuning (per-class parallelism)
+    admin_generate_max_concurrency: int = 2
+
+    # Debug logging (file I/O can slow generation; keep off by default)
+    debug_log_enabled: bool = False
 
     # API Authentication (optional)
     api_key: str | None = None  # API key for service authentication

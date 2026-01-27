@@ -522,34 +522,40 @@ def _generate_questions_niyukti_impl(request: Request, req: NiyuktiGenerateReque
     try:
         from app.observability.logging import log
 
-        # Get tenant_id and corpus_id from headers or use defaults
-        # Niyukti should send these, but we'll use defaults for compatibility
-        tenant_id = request.headers.get("X-Tenant-ID", "niyukti-platform")
+        # Resolve corpus: X-Corpus-ID takes priority over tenant lookup
+        tenant_id = request.headers.get("X-Tenant-ID")
         corpus_id = request.headers.get("X-Corpus-ID")
-        
-        # If corpus_id not provided, try to find default corpus for tenant
-        if not corpus_id:
+
+        if corpus_id:
+            with get_session() as session:
+                corpus = session.get(Corpus, corpus_id)
+                if not corpus:
+                    raise HTTPException(status_code=404, detail="corpus_not_found")
+                # Do NOT reject on tenant mismatch when X-Corpus-ID is provided
+                if tenant_id and corpus.tenant_id != tenant_id:
+                    log.warning(
+                        "tenant_mismatch_ignored_for_corpus_id",
+                        tenant_id=tenant_id,
+                        corpus_id=corpus_id,
+                        corpus_tenant_id=corpus.tenant_id,
+                    )
+        else:
+            if not tenant_id:
+                raise HTTPException(status_code=400, detail="missing_corpus_id_or_tenant_id")
+            # Legacy fallback: resolve corpus by tenant_id
             with get_session() as session:
                 from sqlmodel import select
-                
+
                 corpus = session.exec(
                     select(Corpus).where(Corpus.tenant_id == tenant_id).limit(1)
                 ).first()
-                
+
                 if not corpus:
                     raise HTTPException(
                         status_code=404,
                         detail="no_corpus_found_for_tenant_please_create_corpus_first",
                     )
                 corpus_id = corpus.id
-        
-        # Validate corpus exists and belongs to tenant
-        with get_session() as session:
-            corpus = session.get(Corpus, corpus_id)
-            if not corpus:
-                raise HTTPException(status_code=404, detail="corpus_not_found")
-            if corpus.tenant_id != tenant_id:
-                raise HTTPException(status_code=403, detail="tenant_mismatch")
         
         # PRODUCTION FLOW: Redis → DB → Background Job (NO LLM on user request)
         mapped_subject = _map_subject_name(req.subject)

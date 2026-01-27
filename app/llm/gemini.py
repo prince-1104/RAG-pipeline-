@@ -445,17 +445,6 @@ class GeminiClient:
             }
             raise RuntimeError(f"gemini_empty_response: No text content in response; upstream={upstream}")
 
-        # #region agent log
-        try:
-            import json
-            import os
-            debug_log_path = r"d:\Hopper\NMC projects\RAG-QNA\niyukti-que-gen-Engine\.cursor\debug.log"
-            with open(debug_log_path, "a", encoding="utf-8") as f:
-                f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H2","location":"gemini.py:generate_json:text_extracted","message":"Text extracted from Gemini","data":{"text_length":len(text),"text_preview":text[:300]},"timestamp":int(__import__("time").time()*1000)})+"\n")
-        except Exception:
-            pass
-        # #endregion
-
         # Try to parse JSON, with repair attempts
         parsed = None
         parse_error = None
@@ -463,68 +452,18 @@ class GeminiClient:
         # First attempt: direct parse
         try:
             parsed = json.loads(text)
-            # #region agent log
-            try:
-                import json
-                import os
-                debug_log_path = r"d:\Hopper\NMC projects\RAG-QNA\niyukti-que-gen-Engine\.cursor\debug.log"
-                with open(debug_log_path, "a", encoding="utf-8") as f:
-                    f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H4","location":"gemini.py:generate_json:direct_parse_success","message":"Direct parse succeeded","data":{},"timestamp":int(__import__("time").time()*1000)})+"\n")
-            except Exception:
-                pass
-            # #endregion
         except json.JSONDecodeError as e:
             parse_error = e
-            # #region agent log
-            try:
-                import json
-                import os
-                debug_log_path = r"d:\Hopper\NMC projects\RAG-QNA\niyukti-que-gen-Engine\.cursor\debug.log"
-                with open(debug_log_path, "a", encoding="utf-8") as f:
-                    f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H1,H3","location":"gemini.py:generate_json:direct_parse_failed","message":"Direct parse failed, attempting repair","data":{"error":str(e)[:200],"error_type":type(e).__name__},"timestamp":int(__import__("time").time()*1000)})+"\n")
-            except Exception:
-                pass
-            # #endregion
             # Second attempt: try repairing common issues
             try:
                 repaired = _repair_json(text)
-                # #region agent log
-                try:
-                    import json
-                    import os
-                    debug_log_path = r"d:\Hopper\NMC projects\RAG-QNA\niyukti-que-gen-Engine\.cursor\debug.log"
-                    with open(debug_log_path, "a", encoding="utf-8") as f:
-                        f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H1","location":"gemini.py:generate_json:repair_attempt","message":"Attempting to parse repaired JSON","data":{"repaired_length":len(repaired),"repaired_preview":repaired[-200:]},"timestamp":int(__import__("time").time()*1000)})+"\n")
-                except Exception:
-                    pass
-                # #endregion
                 parsed = json.loads(repaired)
                 # Log that repair worked (for monitoring)
                 import logging
                 logger = logging.getLogger(__name__)
                 logger.debug("gemini_json_repair_succeeded", original_error=str(e)[:100])
-                # #region agent log
-                try:
-                    import json
-                    import os
-                    debug_log_path = r"d:\Hopper\NMC projects\RAG-QNA\niyukti-que-gen-Engine\.cursor\debug.log"
-                    with open(debug_log_path, "a", encoding="utf-8") as f:
-                        f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H1","location":"gemini.py:generate_json:repair_success","message":"Repair succeeded","data":{},"timestamp":int(__import__("time").time()*1000)})+"\n")
-                except Exception:
-                    pass
-                # #endregion
             except Exception as repair_error:
                 # Repair failed, will raise original error below
-                # #region agent log
-                try:
-                    import json
-                    import os
-                    debug_log_path = r"d:\Hopper\NMC projects\RAG-QNA\niyukti-que-gen-Engine\.cursor\debug.log"
-                    with open(debug_log_path, "a", encoding="utf-8") as f:
-                        f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H1,H5","location":"gemini.py:generate_json:repair_failed","message":"Repair failed","data":{"repair_error":str(repair_error)[:200]},"timestamp":int(__import__("time").time()*1000)})+"\n")
-                except Exception:
-                    pass
-                # #endregion
                 pass
         
         if parsed is None:

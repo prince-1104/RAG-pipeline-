@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import uuid
 from typing import Literal
@@ -28,9 +29,136 @@ from app.pools.service import (
     get_or_create_pool,
     mark_pool_failed,
     mark_pool_generating,
+    mark_pool_ready_partial,
 )
 from app.retrieval.retriever import retrieve
+from app.settings import get_settings
 from sqlmodel import select
+
+
+def _pool_system_prompt() -> str:
+    """
+    Pool generation prompt: less strict than admin/sync path.
+    Goal: generate *some* valid questions quickly, even if context is imperfect.
+    """
+    return (
+        "You are an exam question writer for CBSE.\n"
+        "Rules:\n"
+        "- Use ONLY the provided CONTEXT chunks. Do not invent facts.\n"
+        "- If context is insufficient to generate all requested questions, generate fewer and add entries to 'rejected'.\n"
+        "- Every question MUST include >=1 citation pointing to a CHUNK_ID and include a verbatim excerpt.\n"
+        "- Output MUST be valid JSON with keys: questions (array), rejected (array).\n"
+        "- For MCQ questions: provide exactly 4 options as SIMPLE STRINGS.\n"
+        "- Keep questions concise and aligned to the requested difficulty.\n"
+    )
+
+
+def _concept_chunk_id_schema() -> dict:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "concepts": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["name", "chunk_id"],
+                    "properties": {
+                        "name": {"type": "string"},
+                        "chunk_id": {"type": "string"},
+                    },
+                },
+            }
+        },
+        "required": ["concepts"],
+    }
+
+
+def _rank_chunks_for_concept(retrieval, concept: str) -> list[Chunk]:
+    """
+    Heuristic: prefer chunks whose text/excerpt mention concept tokens.
+    Falls back to original retrieval order.
+    """
+    tokens = [t for t in str(concept).lower().split() if len(t) >= 4]
+    scored: list[tuple[int, int, Chunk]] = []
+    for i, r in enumerate(retrieval.chunks or []):
+        c = r.chunk
+        hay = (c.chapter or "") + "\n" + (c.text or "")
+        hay_l = hay.lower()
+        hits = sum(1 for t in tokens if t in hay_l)
+        scored.append((-hits, i, c))  # more hits first, then original order
+    scored.sort()
+    return [c for _, __, c in scored]
+
+
+def _ensure_question_minimums(
+    *,
+    q: dict,
+    concept: str,
+    difficulty: str,
+    chapter_fallback: str,
+    citation_chunk: Chunk,
+    doc_uri_map: dict[str, str],
+) -> None:
+    # id
+    if not isinstance(q.get("id"), str) or not q.get("id"):
+        q["id"] = str(uuid.uuid4())
+
+    # language
+    if not isinstance(q.get("language"), str) or q.get("language") not in ("en", "hi"):
+        q["language"] = "en"
+
+    # tags
+    tags = q.get("tags")
+    if not isinstance(tags, dict):
+        tags = {}
+    tags.setdefault("concept", concept)
+    tags.setdefault("chapter", chapter_fallback or (citation_chunk.chapter or "Unknown"))
+    q["tags"] = tags
+
+    # difficulty
+    q["difficulty"] = difficulty
+
+    # qtype sanity
+    qt = q.get("qtype")
+    if not isinstance(qt, str):
+        qt = ""
+    qt = qt.strip().lower()
+    if qt not in ("mcq", "short", "long", "case_based", "assertion_reason"):
+        # infer best-effort
+        qt = "mcq" if q.get("options") else "short"
+    q["qtype"] = qt
+
+    # options sanity: if mcq but options invalid, downgrade to short
+    if q["qtype"] == "mcq":
+        opts = q.get("options")
+        if not isinstance(opts, list) or len([o for o in opts if isinstance(o, str) and o.strip()]) != 4:
+            q["qtype"] = "short"
+            q["options"] = None
+    else:
+        if "options" not in q:
+            q["options"] = None
+
+    # citations (auto-fill if missing or malformed)
+    cits = q.get("citations")
+    if not isinstance(cits, list) or len(cits) < 1 or not isinstance(cits[0], dict):
+        cits = []
+    if not cits:
+        uri = doc_uri_map.get(citation_chunk.document_id, "unknown")
+        excerpt = (citation_chunk.text or "").replace("\n", " ").strip()[:200]
+        if len(excerpt) < 10:
+            excerpt = (excerpt + " " + (citation_chunk.chapter or "context")).strip()
+        q["citations"] = [
+            {
+                "chunk_id": str(citation_chunk.id),
+                "document_id": str(citation_chunk.document_id),
+                "storage_uri": str(uri or ""),
+                "page_start": int(citation_chunk.page_start or 1),
+                "page_end": int(citation_chunk.page_end or max(1, int(citation_chunk.page_start or 1))),
+                "excerpt": excerpt[:300],
+            }
+        ]
 
 
 def generate_question_pool(
@@ -56,49 +184,25 @@ def generate_question_pool(
     """
     # Step 1: Get or create pool
     pool = get_or_create_pool(syllabus, class_level, subject, difficulty, syllabus_version)
-
-    # #region agent log
-    try:
-        import time as _t
-        with open(r"d:\Hopper\NMC projects\RAG-QNA\niyukti-que-gen-Engine\.cursor\debug.log", "a", encoding="utf-8") as _f:
-            _f.write(
-                json.dumps(
-                    {
-                        "sessionId": "debug-session",
-                        "runId": "run1",
-                        "hypothesisId": "A",
-                        "location": "pool_generation.py:generate_question_pool:entry",
-                        "message": "pool_generation_entry",
-                        "data": {
-                            "pool_id": pool.id,
-                            "pool_status": str(pool.status),
-                            "corpus_id": corpus_id,
-                            "syllabus": syllabus,
-                            "class_level": class_level,
-                            "subject": subject,
-                            "difficulty": difficulty,
-                            "syllabus_version": syllabus_version,
-                            "target_count": target_count,
-                        },
-                        "timestamp": int(_t.time() * 1000),
-                    }
-                )
-                + "\n"
-            )
-    except Exception:
-        pass
-    # #endregion
     
+    # If fully ready, no work to do.
     if pool.status == QuestionPoolStatus.ready:
         log.info("pool_already_ready", pool_id=pool.id)
         return
     
-    # Mark as generating
-    mark_pool_generating(pool.id)
+    # Mark as generating only if not already serving from a partial pool.
+    if pool.status != QuestionPoolStatus.ready_partial:
+        mark_pool_generating(pool.id)
     
     try:
+        s = get_settings()
+        requested_count = target_count
+        min_abs = max(1, int(getattr(s, "pool_generation_min_absolute", 10) or 10))
+        min_frac = float(getattr(s, "pool_generation_min_fraction", 0.2) or 0.2)
+        min_acceptable = max(min_abs, int(requested_count * min_frac))
+
         # Step 2: Retrieve top 5-8 chunks (STRICT LIMIT)
-        top_k = 8
+        top_k = max(3, int(getattr(s, "pool_generation_context_chunks", 6) or 6))
         query = f"{syllabus} {subject} class {class_level} syllabus version {syllabus_version}"
         
         # Use a generic query that retrieves diverse content
@@ -110,33 +214,6 @@ def generate_question_pool(
             query=query,
             top_k=top_k,
         )
-
-        # #region agent log
-        try:
-            import time as _t
-            with open(r"d:\Hopper\NMC projects\RAG-QNA\niyukti-que-gen-Engine\.cursor\debug.log", "a", encoding="utf-8") as _f:
-                _f.write(
-                    json.dumps(
-                        {
-                            "sessionId": "debug-session",
-                            "runId": "run1",
-                            "hypothesisId": "B",
-                            "location": "pool_generation.py:generate_question_pool:after_retrieve",
-                            "message": "retrieval_result",
-                            "data": {
-                                "pool_id": pool.id,
-                                "chunks": len(rr.chunks) if rr and rr.chunks else 0,
-                                "confidence": getattr(rr, "confidence", None),
-                                "query": getattr(rr, "query", "")[:200],
-                            },
-                            "timestamp": int(_t.time() * 1000),
-                        }
-                    )
-                    + "\n"
-                )
-        except Exception:
-            pass
-        # #endregion
         
         if not rr.chunks or len(rr.chunks) < 3:
             raise ValueError(f"Insufficient chunks retrieved: {len(rr.chunks) if rr.chunks else 0}")
@@ -148,166 +225,146 @@ def generate_question_pool(
             docs = session.exec(select(Document).where(Document.corpus_id == corpus_id)).all()
         doc_uri_map = {d.id: d.storage_uri for d in docs}
         
-        # Step 3: Phase 1 - Extract examinable concepts
-        concepts = _extract_concepts(rr, doc_uri_map, difficulty)
+        # Step 3: Phase 1 - Extract examinable concepts (+ supporting chunk_id)
+        extracted = _extract_concepts(rr, doc_uri_map, difficulty)
+        concepts = [c["name"] for c in extracted]
+        concept_to_chunk_id = {c["name"]: c.get("chunk_id", "") for c in extracted}
         
         if not concepts:
             raise ValueError("No examinable concepts extracted")
         
         log.info("concepts_extracted", pool_id=pool.id, concept_count=len(concepts))
-
-        # #region agent log
-        try:
-            import time as _t
-            with open(r"d:\Hopper\NMC projects\RAG-QNA\niyukti-que-gen-Engine\.cursor\debug.log", "a", encoding="utf-8") as _f:
-                _f.write(
-                    json.dumps(
-                        {
-                            "sessionId": "debug-session",
-                            "runId": "run1",
-                            "hypothesisId": "C",
-                            "location": "pool_generation.py:generate_question_pool:concepts",
-                            "message": "concepts_extracted",
-                            "data": {
-                                "pool_id": pool.id,
-                                "concept_count": len(concepts),
-                                "concept_sample": concepts[:5],
-                                "questions_per_concept": max(1, target_count // max(1, len(concepts))),
-                            },
-                            "timestamp": int(_t.time() * 1000),
-                        }
-                    )
-                    + "\n"
-                )
-        except Exception:
-            pass
-        # #endregion
         
         # Step 4: Phase 2 - Generate questions per concept
         all_questions: list[dict] = []
-        questions_per_concept = max(1, target_count // len(concepts))
-        
-        for idx, concept in enumerate(concepts):
-            try:
-                concept_questions = _generate_questions_for_concept(
+        questions_per_concept = min(8, max(1, target_count // len(concepts)))
+
+        max_workers = max(1, int(getattr(s, "pool_generation_max_concurrency", 6) or 6))
+        log.info(
+            "pool_generation_parallel_start",
+            pool_id=pool.id,
+            concepts=len(concepts),
+            questions_per_concept=questions_per_concept,
+            max_workers=max_workers,
+        )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_concept: dict[concurrent.futures.Future[list[dict]], str] = {}
+            for concept in concepts:
+                future = executor.submit(
+                    _generate_questions_for_concept,
                     concept=concept,
                     retrieval=rr,
                     doc_uri_map=doc_uri_map,
                     difficulty=difficulty,
                     count=questions_per_concept,
                     corpus_id=corpus_id,
+                    preferred_chunk_id=concept_to_chunk_id.get(concept) or None,
                 )
-                all_questions.extend(concept_questions)
+                future_to_concept[future] = concept
 
-                # #region agent log
-                # Log only first few concepts to keep logs small.
-                if idx < 3:
-                    try:
-                        import time as _t
-                        with open(r"d:\Hopper\NMC projects\RAG-QNA\niyukti-que-gen-Engine\.cursor\debug.log", "a", encoding="utf-8") as _f:
-                            _f.write(
-                                json.dumps(
-                                    {
-                                        "sessionId": "debug-session",
-                                        "runId": "run1",
-                                        "hypothesisId": "D",
-                                        "location": "pool_generation.py:generate_question_pool:concept_loop",
-                                        "message": "concept_generation_summary",
-                                        "data": {
-                                            "pool_id": pool.id,
-                                            "concept_idx": idx,
-                                            "concept": concept[:120],
-                                            "returned": len(concept_questions),
-                                            "total_so_far": len(all_questions),
-                                        },
-                                        "timestamp": int(_t.time() * 1000),
-                                    }
-                                )
-                                + "\n"
-                            )
-                    except Exception:
-                        pass
-                # #endregion
-                
-                # Stop if we have enough questions
+            for future in concurrent.futures.as_completed(future_to_concept.keys()):
+                concept = future_to_concept[future]
+                try:
+                    concept_questions = future.result()
+                    all_questions.extend(concept_questions)
+                except Exception as e:  # noqa: BLE001
+                    log.warning("concept_generation_failed", concept=concept, error=str(e)[:200])
+                    continue
+
                 if len(all_questions) >= target_count:
+                    # Best-effort cancellation of remaining work
+                    for f in future_to_concept.keys():
+                        if f is not future:
+                            f.cancel()
                     break
-            except Exception as e:
-                log.warning("concept_generation_failed", concept=concept, error=str(e))
-                continue
-        
-        if len(all_questions) < 50:  # Minimum viable pool size
-            # #region agent log
-            try:
-                import time as _t
-                with open(r"d:\Hopper\NMC projects\RAG-QNA\niyukti-que-gen-Engine\.cursor\debug.log", "a", encoding="utf-8") as _f:
-                    _f.write(
-                        json.dumps(
-                            {
-                                "sessionId": "debug-session",
-                                "runId": "run1",
-                                "hypothesisId": "E",
-                                "location": "pool_generation.py:generate_question_pool:insufficient",
-                                "message": "insufficient_questions",
-                                "data": {
-                                    "pool_id": pool.id,
-                                    "generated": len(all_questions),
-                                    "min_required": 50,
-                                    "target_count": target_count,
-                                    "concept_count": len(concepts),
-                                    "questions_per_concept": questions_per_concept,
-                                },
-                                "timestamp": int(_t.time() * 1000),
-                            }
-                        )
-                        + "\n"
-                    )
-            except Exception:
-                pass
-            # #endregion
-            raise ValueError(f"Insufficient questions generated: {len(all_questions)}")
-        
+
+        generated = len(all_questions)
+        log.info(
+            "pool_generation_yield",
+            pool_id=pool.id,
+            requested=requested_count,
+            generated=generated,
+            min_acceptable=min_acceptable,
+        )
+
+        if generated == 0:
+            # Hard fail only when absolutely nothing was generated.
+            mark_pool_failed(pool.id, "insufficient_questions:0")
+            return
+
         # Step 5: Store questions in DB
         question_ids = _store_pool_questions(pool.id, all_questions, corpus_id, class_level, subject)
-        
-        # Step 6: Add to Redis
-        add_questions_to_pool(pool.id, question_ids)
+
+        # Step 6: Add to Redis and set pool status
+        if generated < requested_count:
+            # Best-effort: partial pool is still serveable; trigger backfill via API path if needed.
+            add_questions_to_pool(
+                pool.id,
+                question_ids,
+                requested_count=requested_count,
+                generated_count=generated,
+                status=QuestionPoolStatus.ready_partial,
+                last_error=("insufficient_questions" if generated < min_acceptable else None),
+            )
+            # Persist status/counters even if Redis add fails
+            mark_pool_ready_partial(
+                pool.id,
+                requested_count=requested_count,
+                generated_count=generated,
+                last_error=("insufficient_questions" if generated < min_acceptable else None),
+            )
+        else:
+            add_questions_to_pool(
+                pool.id,
+                question_ids,
+                requested_count=requested_count,
+                generated_count=generated,
+                status=QuestionPoolStatus.ready,
+                last_error=None,
+            )
         
         log.info("pool_generation_complete", pool_id=pool.id, question_count=len(question_ids))
         
     except Exception as e:
+        # Do not crash the worker; mark failed and exit.
         log.exception("pool_generation_error", pool_id=pool.id, error=str(e))
-        mark_pool_failed(pool.id, str(e))
-        raise
+        mark_pool_failed(pool.id, str(e)[:500])
+        return
 
 
 def _extract_concepts(
     retrieval_result,
     doc_uri_map: dict[str, str],
     difficulty: str,
-) -> list[str]:
+) -> list[dict]:
     """
-    Phase 1: Ask LLM to list examinable concepts only.
-    Returns list of concept names.
+    Phase 1: Ask LLM to list examinable concepts grounded in context.
+    Returns list of dicts: {"name": str, "chunk_id": str}
     """
+    s = get_settings()
     client = get_llm_client()
     system_prompt = (
         "You are an educational content analyzer for CBSE.\n"
         "Your task: Extract examinable concepts from the provided context.\n"
-        "Return ONLY a JSON array of concept names (strings).\n"
-        "Example: [\"Photosynthesis\", \"Cell Structure\", \"Chemical Reactions\"]\n"
+        "Return concepts grounded in the provided chunks only.\n"
+        "Return JSON with key 'concepts': array of objects {name, chunk_id}.\n"
+        "Each chunk_id MUST be one of the CHUNK_ID values shown in CONTEXT.\n"
         f"Focus on concepts suitable for {difficulty} difficulty questions."
     )
     
     # Build context from retrieval
     ctx_lines: list[str] = []
-    for r in retrieval_result.chunks[:5]:  # Use top 5 for concept extraction
+    take = min(5, max(3, int(getattr(s, "pool_generation_context_chunks", 6) or 6)))
+    chunk_chars = max(200, int(getattr(s, "pool_generation_chunk_chars", 900) or 900))
+    for r in retrieval_result.chunks[:take]:  # Use top-k for concept extraction
         c = r.chunk
         uri = doc_uri_map.get(c.document_id, "unknown")
-        chunk_text = c.text[:1000]  # Shorter for concept extraction
+        chunk_text = c.text[:chunk_chars]  # Keep small for speed
         ctx_lines.extend([
+            f"CHUNK_ID: {c.id}",
             f"CHAPTER: {c.chapter}",
-            f"TEXT: {chunk_text[:500]}",
+            f"TEXT: {chunk_text[: min(500, len(chunk_text))]}",
             "---",
         ])
     
@@ -316,51 +373,51 @@ def _extract_concepts(
         "\n".join(ctx_lines),
         "",
         f"Extract 8-12 examinable concepts suitable for {difficulty} difficulty questions.",
-        "Return JSON array of concept names only.",
+        "For each concept, pick the single best supporting CHUNK_ID from the context.",
+        "Return JSON object: {\"concepts\": [{\"name\": \"...\", \"chunk_id\": \"...\"}, ...]}",
     ])
     
     try:
-        # Use a simpler schema for concept extraction
-        concept_schema = {
-            "type": "object",
-            "properties": {
-                "concepts": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                }
-            },
-            "required": ["concepts"],
-        }
-        
         result = client.generate_json(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
-            json_schema=concept_schema,
+            json_schema=_concept_chunk_id_schema(),
         )
         
-        # Handle both cases: object with "concepts" key, or direct array
-        parsed = result.parsed_json
-        if isinstance(parsed, list):
-            # Gemini returned array directly
-            concepts = parsed
-        elif isinstance(parsed, dict):
-            # Gemini returned object with "concepts" key
-            concepts = parsed.get("concepts", [])
-        else:
-            concepts = []
-        
+        parsed = result.parsed_json if isinstance(result.parsed_json, dict) else {}
+        concepts = parsed.get("concepts", [])
         if not isinstance(concepts, list):
             concepts = []
-        
-        # Filter and normalize
-        concepts = [c.strip() for c in concepts if isinstance(c, str) and c.strip()][:12]
-        
-        return concepts if concepts else ["General Concepts"]  # Fallback
+
+        allowed_chunk_ids = {str(r.chunk.id) for r in retrieval_result.chunks[:take]}
+        out: list[dict] = []
+        for c in concepts:
+            if not isinstance(c, dict):
+                continue
+            name = str(c.get("name") or "").strip()
+            chunk_id = str(c.get("chunk_id") or "").strip()
+            if not name:
+                continue
+            if chunk_id not in allowed_chunk_ids:
+                chunk_id = ""
+            out.append({"name": name, "chunk_id": chunk_id})
+
+        # Deduplicate by name, keep first
+        seen: set[str] = set()
+        deduped: list[dict] = []
+        for item in out:
+            k = item["name"].lower()
+            if k in seen:
+                continue
+            seen.add(k)
+            deduped.append(item)
+
+        return deduped[:12] if deduped else [{"name": "General Concepts", "chunk_id": ""}]
         
     except Exception as e:
         log.warning("concept_extraction_failed", error=str(e))
         # Fallback: use chapter names as concepts
-        return list({r.chunk.chapter for r in retrieval_result.chunks[:5] if r.chunk.chapter})
+        return [{"name": str(ch), "chunk_id": ""} for ch in list({r.chunk.chapter for r in retrieval_result.chunks[:5] if r.chunk.chapter})]
 
 
 def _generate_questions_for_concept(
@@ -370,20 +427,29 @@ def _generate_questions_for_concept(
     difficulty: str,
     count: int,
     corpus_id: str,
+    preferred_chunk_id: str | None = None,
 ) -> list[dict]:
     """
     Phase 2: Generate N questions for a specific concept.
     LLM prompt MUST specify difficulty explicitly.
     """
+    s = get_settings()
     client = get_llm_client()
-    system_prompt = build_system_prompt()
+    system_prompt = _pool_system_prompt()
     
     # Build context with concept focus
     ctx_lines: list[str] = []
-    for r in retrieval.chunks[:8]:
-        c = r.chunk
+    take = max(3, int(getattr(s, "pool_generation_context_chunks", 6) or 6))
+    chunk_chars = max(400, int(getattr(s, "pool_generation_chunk_chars", 900) or 900))
+    ranked = _rank_chunks_for_concept(retrieval, concept)
+    if preferred_chunk_id:
+        preferred = [c for c in ranked if str(getattr(c, "id", "")) == str(preferred_chunk_id)]
+        rest = [c for c in ranked if str(getattr(c, "id", "")) != str(preferred_chunk_id)]
+        ranked = preferred + rest
+    picked = ranked[:take] if ranked else [r.chunk for r in (retrieval.chunks or [])[:take]]
+    for c in picked:
         uri = doc_uri_map.get(c.document_id, "unknown")
-        chunk_text = c.text[:1500]
+        chunk_text = c.text[:chunk_chars]
         excerpt = c.text[:200].replace("\n", " ")
         ctx_lines.extend([
             "----",
@@ -408,9 +474,10 @@ def _generate_questions_for_concept(
         f"DIFFICULTY: {difficulty}",
         f"DIFFICULTY_GUIDANCE: {difficulty_guidance[difficulty]}",
         "",
-        f"Generate {count} questions about '{concept}'.",
+        f"Generate up to {count} questions about '{concept}'.",
         f"ALL questions must be {difficulty} difficulty.",
         "Question types: mcq, short, long (mix as appropriate).",
+        "If the context is insufficient for all questions, generate fewer and add the remainder to 'rejected' with reason=INSUFFICIENT_CONTEXT.",
         "",
         "CONTEXT:",
         "\n".join(ctx_lines),
@@ -436,13 +503,34 @@ def _generate_questions_for_concept(
             log.warning("question_validation_issues", concept=concept, issues_count=len(issues))
             # Continue with partial results
         
-        questions = result.parsed_json.get("questions", []) or []
+        questions = result.parsed_json.get("questions", []) if isinstance(result.parsed_json, dict) else []
+        if not isinstance(questions, list):
+            log.warning("question_generation_no_questions_array", concept=concept)
+            return []
+        if not questions:
+            log.warning("question_generation_empty", concept=concept)
+            return []
         
         # Fix citations
         for q in questions:
             for cit in q.get("citations", []) or []:
                 did = cit.get("document_id")
                 cit["storage_uri"] = doc_uri_map.get(did, cit.get("storage_uri", ""))
+
+        # Auto-fill missing required fields so we don't end up with 0 questions
+        chapter_fallback = (picked[0].chapter if picked and picked[0].chapter else "Unknown")
+        citation_chunk = picked[0] if picked else (retrieval.chunks[0].chunk if retrieval.chunks else None)
+        if citation_chunk is not None:
+            for q in questions:
+                if isinstance(q, dict):
+                    _ensure_question_minimums(
+                        q=q,
+                        concept=concept,
+                        difficulty=difficulty,
+                        chapter_fallback=chapter_fallback,
+                        citation_chunk=citation_chunk,
+                        doc_uri_map=doc_uri_map,
+                    )
         
         # Filter by difficulty and apply guardrails
         valid_questions: list[dict] = []
@@ -476,34 +564,15 @@ def _generate_questions_for_concept(
                 q["tags"] = {**(q.get("tags") or {}), "chapter": chapter, "dedupe_key": dk, "concept": concept}
                 valid_questions.append(q)
 
-        # #region agent log
-        try:
-            import time as _t
-            with open(r"d:\Hopper\NMC projects\RAG-QNA\niyukti-que-gen-Engine\.cursor\debug.log", "a", encoding="utf-8") as _f:
-                _f.write(
-                    json.dumps(
-                        {
-                            "sessionId": "debug-session",
-                            "runId": "run1",
-                            "hypothesisId": "F",
-                            "location": "pool_generation.py:_generate_questions_for_concept:summary",
-                            "message": "concept_questions_counts",
-                            "data": {
-                                "concept": concept[:120],
-                                "raw_questions": len(questions),
-                                "valid_questions": len(valid_questions),
-                                "issues_count": len(issues),
-                                "reject_reasons": rej_counts,
-                            },
-                            "timestamp": int(_t.time() * 1000),
-                        }
-                    )
-                    + "\n"
-                )
-        except Exception:
-            pass
-        # #endregion
-        
+        log.info(
+            "concept_generation_done",
+            concept=concept,
+            raw_questions=len(questions),
+            valid_questions=len(valid_questions),
+            issues_count=len(issues),
+            reject_reasons=rej_counts,
+        )
+
         return valid_questions[:count]  # Limit to requested count
         
     except Exception as e:

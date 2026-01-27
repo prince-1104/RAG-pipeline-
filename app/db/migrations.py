@@ -141,11 +141,94 @@ def migrate_add_job_kind_admin_generate_questions() -> None:
                 raise
 
 
+def migrate_add_question_pool_status_ready_partial() -> None:
+    """
+    Add 'ready_partial' to the QuestionPoolStatus enum if it doesn't exist.
+    Only needed when QuestionPoolStatus is backed by a PostgreSQL enum type.
+    """
+    engine = get_engine()
+    if not engine.url.drivername.startswith("postgresql"):
+        log.info("migration_skipped", reason="not_postgresql", migration="add_question_pool_status_enum")
+        return
+
+    with Session(engine) as session:
+        try:
+            result = session.exec(
+                text(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM pg_enum
+                        WHERE enumlabel = 'ready_partial'
+                        AND enumtypid = (
+                            SELECT oid
+                            FROM pg_type
+                            WHERE typname = 'questionpoolstatus'
+                        )
+                    )
+                    """
+                )
+            ).first()
+
+            if result and not result[0]:
+                log.info("migration_adding_enum_value", enum="QuestionPoolStatus", value="ready_partial")
+                session.exec(text("ALTER TYPE questionpoolstatus ADD VALUE IF NOT EXISTS 'ready_partial'"))
+                session.commit()
+                log.info("migration_enum_value_added", enum="QuestionPoolStatus", value="ready_partial")
+            else:
+                log.info("migration_enum_value_exists", enum="QuestionPoolStatus", value="ready_partial")
+        except Exception as e:
+            # If enum doesn't exist as a PostgreSQL type (e.g., using VARCHAR), skip
+            if "does not exist" in str(e).lower() or "type" in str(e).lower():
+                log.info("migration_skipped", reason="enum_not_postgres_type", migration="add_question_pool_status_enum")
+            else:
+                session.rollback()
+                log.exception("migration_error", error=str(e))
+                raise
+
+
+def migrate_add_question_pool_bookkeeping_fields() -> None:
+    """
+    Add requested_count, generated_count, last_error columns to questionpool table if missing.
+    Idempotent.
+    """
+    engine = get_engine()
+    with Session(engine) as session:
+        try:
+            result = session.exec(
+                text(
+                    """
+                    SELECT column_name
+                    FROM information_schema.columns
+                    WHERE table_name = 'questionpool'
+                    AND column_name IN ('requested_count', 'generated_count', 'last_error')
+                    """
+                )
+            ).all()
+            existing_columns = {row[0] for row in result}
+
+            if "requested_count" not in existing_columns:
+                session.exec(text("ALTER TABLE questionpool ADD COLUMN requested_count INTEGER"))
+            if "generated_count" not in existing_columns:
+                session.exec(text("ALTER TABLE questionpool ADD COLUMN generated_count INTEGER"))
+            if "last_error" not in existing_columns:
+                session.exec(text("ALTER TABLE questionpool ADD COLUMN last_error VARCHAR"))
+
+            session.commit()
+            log.info("migration_complete", migration="add_question_pool_bookkeeping_fields")
+        except Exception as e:
+            session.rollback()
+            log.exception("migration_error", error=str(e))
+            raise
+
+
 def run_all_migrations() -> None:
     """Run all pending migrations."""
     log.info("migrations_starting")
     migrate_add_document_syllabus_fields()
     migrate_add_job_kind_admin_generate_questions()
+    migrate_add_question_pool_status_ready_partial()
+    migrate_add_question_pool_bookkeeping_fields()
     log.info("migrations_complete")
 
 

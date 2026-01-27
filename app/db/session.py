@@ -36,6 +36,14 @@ def init_db() -> None:
     if ENGINE is None:
         ENGINE = get_engine()
     SQLModel.metadata.create_all(ENGINE)
+    # Run idempotent migrations (safe on every startup)
+    try:
+        from app.db.migrations import run_all_migrations
+
+        run_all_migrations()
+    except Exception:
+        # Do not block startup if migrations fail in dev; errors will be logged by migrator.
+        pass
 
 
 def get_session() -> Session:

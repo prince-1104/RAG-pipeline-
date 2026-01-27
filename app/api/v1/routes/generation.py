@@ -123,7 +123,7 @@ def serve_from_pool(request: Request, req: PoolRequest):
             syllabus_version=req.syllabus_version,
         )
         
-        if pool_status == QuestionPoolStatus.ready:
+        if pool_status in (QuestionPoolStatus.ready, QuestionPoolStatus.ready_partial):
             # Fast path: fetch from Redis
             questions = get_questions_from_pool(
                 syllabus=req.syllabus,
@@ -140,8 +140,14 @@ def serve_from_pool(request: Request, req: PoolRequest):
                     q_data = json.loads(pq.question_json)
                     all_questions.append(q_data)
             else:
-                # Pool exists but insufficient questions - trigger refresh
-                overall_status = "generating"
+                # Partial/insufficient: return what we have and trigger backfill
+                if questions:
+                    for pq in questions:
+                        q_data = json.loads(pq.question_json)
+                        all_questions.append(q_data)
+                    overall_status = "ready_partial"
+                else:
+                    overall_status = "generating"
                 _trigger_pool_generation(
                     corpus_id=req.corpus_id,
                     syllabus=req.syllabus,
@@ -179,10 +185,10 @@ def serve_from_pool(request: Request, req: PoolRequest):
             )
     
     # Return response
-    if overall_status == "ready" and all_questions:
+    if overall_status in ("ready", "ready_partial") and all_questions:
         return PoolResponse(
             questions=all_questions,
-            status="ready",
+            status=overall_status,
             pool_info=pool_info,
         )
     else:

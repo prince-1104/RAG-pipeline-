@@ -148,6 +148,7 @@ class QuestionPoolStatus(str, enum.Enum):
     pending = "pending"
     generating = "generating"
     ready = "ready"
+    ready_partial = "ready_partial"
     failed = "failed"
 
 
@@ -166,6 +167,11 @@ class QuestionPool(SQLModel, table=True):
     syllabus_version: str = Field(index=True, default="2024")  # e.g., "2024"
     
     status: QuestionPoolStatus = Field(index=True, default=QuestionPoolStatus.pending)
+
+    # Best-effort generation bookkeeping
+    requested_count: int | None = Field(default=None)
+    generated_count: int | None = Field(default=None)
+    last_error: str | None = Field(default=None)
     
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)

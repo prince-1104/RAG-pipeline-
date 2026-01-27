@@ -44,31 +44,12 @@ def retrieve(
     - then similarity search on candidate subset
     """
     settings = get_settings()
-    # #region agent log
-    try:
-        import json
-        from app.debug_log import DEBUG_LOG_PATH, ensure_log_dir
-        ensure_log_dir()
-        with open(DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"E","location":"retriever.py:46","message":"Retrieval started","data":{"corpus_id":corpus_id,"class_level":class_level,"subject":subject,"chapters":chapters[:5],"top_k":top_k},"timestamp":int(__import__("time").time()*1000)})+"\n")
-    except Exception:
-        pass
-    # #endregion
     try:
         # Handle async load_index in sync context
         # Since this is a sync function, we can safely use asyncio.run()
         # If there's already a running loop (shouldn't happen), we'll handle it
         try:
             meta, vectors, _index = asyncio.run(load_index(corpus_id, class_level, subject))
-            # #region agent log
-            try:
-                import json
-                from app.debug_log import DEBUG_LOG_PATH
-                with open(DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
-                    f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"E","location":"retriever.py:52","message":"Index loaded","data":{"chunk_count":len(meta.chunk_ids) if meta else 0},"timestamp":int(__import__("time").time()*1000)})+"\n")
-            except Exception:
-                pass
-            # #endregion
         except RuntimeError:
             # If asyncio.run() fails (running loop exists), create new loop in thread
             import threading
@@ -101,26 +82,8 @@ def retrieve(
     except Exception as e:  # noqa: BLE001
         error_msg = str(e)[:500]
         log.warning("missing_index", corpus_id=corpus_id, class_level=class_level, subject=subject, error=error_msg, error_type=type(e).__name__)
-        # #region agent log
-        try:
-            import json
-            from app.debug_log import DEBUG_LOG_PATH
-            with open(DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
-                f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"E","location":"retriever.py:82","message":"Index load failed","data":{"error":error_msg,"error_type":type(e).__name__},"timestamp":int(__import__("time").time()*1000)})+"\n")
-        except Exception:
-            pass
-        # #endregion
         return RetrievalResult(query=query, chunks=[], confidence=0.0)
     if not meta.chunk_ids:
-        # #region agent log
-        try:
-            import json
-            from app.debug_log import DEBUG_LOG_PATH
-            with open(DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
-                f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"B","location":"retriever.py:86","message":"No chunk IDs in index","data":{"corpus_id":corpus_id,"class_level":class_level,"subject":subject},"timestamp":int(__import__("time").time()*1000)})+"\n")
-        except Exception:
-            pass
-        # #endregion
         return RetrievalResult(query=query, chunks=[], confidence=0.0)
 
     # 1) metadata filter (DB) -> candidate chunk_ids
@@ -243,15 +206,6 @@ def retrieve(
             ]
             available_chapters = list({c.chapter for c in matching_chunks})[:20]
             available_subjects = list({c.subject for c in all_chunks_for_logging if c.subject})[:10]
-            # #region agent log
-            try:
-                import json
-                from app.debug_log import DEBUG_LOG_PATH
-                with open(DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
-                    f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"C","location":"retriever.py:163","message":"No candidates found","data":{"requested_subject":subject,"normalized_subject":normalized_subject,"requested_chapters":chapters,"available_chapters":available_chapters,"available_subjects":available_subjects,"total_chunks_for_class":len(all_chunks_for_logging),"matching_chunks":len(matching_chunks)},"timestamp":int(__import__("time").time()*1000)})+"\n")
-            except Exception:
-                pass
-            # #endregion
             log.warning(
                 "retrieval_no_chapter_match",
                 corpus_id=corpus_id,
@@ -296,15 +250,6 @@ def retrieve(
 
     conf = float(results[0].score) if results else 0.0
     conf = max(0.0, min(1.0, (conf + 1.0) / 2.0)) if not math.isnan(conf) else 0.0
-    # #region agent log
-    try:
-        import json
-        from app.debug_log import DEBUG_LOG_PATH
-        with open(DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"D","location":"retriever.py:224","message":"Confidence calculated","data":{"raw_score":float(results[0].score) if results else 0.0,"normalized_confidence":conf,"min_threshold":settings.min_retrieval_confidence,"chunks_found":len(results),"below_threshold":conf<settings.min_retrieval_confidence},"timestamp":int(__import__("time").time()*1000)})+"\n")
-    except Exception:
-        pass
-    # #endregion
 
     if conf < settings.min_retrieval_confidence:
         log.warning(
