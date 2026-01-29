@@ -212,6 +212,6 @@ Questions are stored in:
 - Questions are distributed evenly across classes in the range
 - If chapters are not specified, they are auto-detected from chunks
 - Questions reuse existing generation pipeline (same quality, guardrails, validation)
-- Redis pools are keyed by: `qp:{syllabus}:{class}:{subject}:{chapter}:{difficulty}:{version}`
+- Redis pools are keyed by: `qp:{syllabus}:{class}:{subject}:{difficulty}:{version}`
 - Pools are chapter-scoped; each chapter has its own pool per difficulty
 - Questions are shuffled before being added to Redis for randomization

@@ -36,11 +36,17 @@ from app.settings import get_settings
 from sqlmodel import select
 
 
-def _pool_system_prompt() -> str:
+def _pool_system_prompt(difficulty: str) -> str:
     """
     Pool generation prompt: less strict than admin/sync path.
     Goal: generate *some* valid questions quickly, even if context is imperfect.
     """
+    difficulty_guidance = {
+        "easy": "Focus on direct recall, definitions, and single-step questions.",
+        "medium": "Focus on conceptual understanding and 1-2 step reasoning.",
+        "hard": "Focus on multi-step reasoning, analysis, and synthesis.",
+    }
+    guidance = difficulty_guidance.get(difficulty, difficulty_guidance["medium"])
     return (
         "You are an exam question writer for CBSE.\n"
         "Rules:\n"
@@ -49,7 +55,7 @@ def _pool_system_prompt() -> str:
         "- Every question MUST include >=1 citation pointing to a CHUNK_ID and include a verbatim excerpt.\n"
         "- Output MUST be valid JSON with keys: questions (array), rejected (array).\n"
         "- For MCQ questions: provide exactly 4 options as SIMPLE STRINGS.\n"
-        "- Keep questions concise and aligned to the requested difficulty.\n"
+        f"- Keep questions concise and aligned to the requested difficulty.\n- {guidance}\n"
     )
 
 
@@ -185,6 +191,16 @@ def generate_question_pool(
     """
     # Step 1: Get or create pool
     pool = get_or_create_pool(syllabus, class_level, subject, chapter, difficulty, syllabus_version)
+    # Do not generate beyond requested_count (if already satisfied)
+    if pool.requested_count is not None and pool.generated_count is not None:
+        if int(pool.generated_count) >= int(pool.requested_count):
+            log.info(
+                "pool_generation_cap_skip",
+                pool_id=pool.id,
+                requested=pool.requested_count,
+                generated=pool.generated_count,
+            )
+            return
     
     # If fully ready, no work to do.
     if pool.status == QuestionPoolStatus.ready:
@@ -198,8 +214,19 @@ def generate_question_pool(
     try:
         s = get_settings()
         requested_count = target_count
-        min_abs = max(1, int(getattr(s, "pool_generation_min_absolute", 10) or 10))
-        min_frac = float(getattr(s, "pool_generation_min_fraction", 0.2) or 0.2)
+        # Difficulty-specific acceptance thresholds (fallback to global defaults)
+        min_abs_by_diff = {
+            "easy": int(getattr(s, "pool_generation_min_absolute_easy", 10) or 10),
+            "medium": int(getattr(s, "pool_generation_min_absolute_medium", 10) or 10),
+            "hard": int(getattr(s, "pool_generation_min_absolute_hard", 10) or 10),
+        }
+        min_frac_by_diff = {
+            "easy": float(getattr(s, "pool_generation_min_fraction_easy", 0.2) or 0.2),
+            "medium": float(getattr(s, "pool_generation_min_fraction_medium", 0.2) or 0.2),
+            "hard": float(getattr(s, "pool_generation_min_fraction_hard", 0.2) or 0.2),
+        }
+        min_abs = max(1, min_abs_by_diff.get(difficulty, 10))
+        min_frac = min_frac_by_diff.get(difficulty, 0.2)
         min_acceptable = max(min_abs, int(requested_count * min_frac))
 
         # Step 2: Retrieve top 5-8 chunks (STRICT LIMIT)
@@ -436,7 +463,7 @@ def _generate_questions_for_concept(
     """
     s = get_settings()
     client = get_llm_client()
-    system_prompt = _pool_system_prompt()
+    system_prompt = _pool_system_prompt(difficulty)
     
     # Build context with concept focus
     ctx_lines: list[str] = []

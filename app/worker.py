@@ -109,7 +109,7 @@ def run_forever() -> None:
                     chapter=job_data.get("chapter", "Unknown Chapter"),
                     difficulty=job_data["difficulty"],
                     syllabus_version=job_data.get("syllabus_version", "2024"),
-                    target_count=200,  # Generate 200 questions per pool
+                    target_count=int(job_data.get("target_count") or 200),
                 )
                 _finish_job_success(job.id, result={"ok": True, "pool_generated": True})
             elif job.kind == JobKind.refresh_question_pool:
@@ -124,7 +124,7 @@ def run_forever() -> None:
                     chapter=job_data.get("chapter", "Unknown Chapter"),
                     difficulty=job_data["difficulty"],
                     syllabus_version=job_data.get("syllabus_version", "2024"),
-                    target_count=200,
+                    target_count=int(job_data.get("target_count") or 200),
                 )
                 _finish_job_success(job.id, result={"ok": True, "pool_refreshed": True})
             elif job.kind == JobKind.admin_generate_questions:

@@ -15,12 +15,11 @@ def get_pool_key(
     syllabus: str,
     class_level: int,
     subject: str,
-    chapter: str,
     difficulty: str,
     syllabus_version: str,
 ) -> str:
     """Generate Redis key for a question pool."""
-    return f"qp:{syllabus}:{class_level}:{subject}:{chapter}:{difficulty}:{syllabus_version}"
+    return f"qp:{syllabus}:{class_level}:{subject}:{difficulty}:{syllabus_version}"
 
 
 def list_pool_chapters(corpus_id: str, class_level: int, subject: str) -> list[str]:
@@ -84,7 +83,7 @@ def get_or_create_pool(
             log.info(
                 "question_pool_created",
                 pool_id=pool.id,
-                key=get_pool_key(syllabus, class_level, subject, chapter, difficulty, syllabus_version),
+                key=get_pool_key(syllabus, class_level, subject, difficulty, syllabus_version),
             )
         
         return pool
@@ -127,7 +126,7 @@ def get_questions_from_pool(
     Returns empty list if pool is not ready or insufficient questions.
     """
     redis_client = get_redis_client()
-    pool_key = get_pool_key(syllabus, class_level, subject, chapter, difficulty, syllabus_version)
+    pool_key = get_pool_key(syllabus, class_level, subject, difficulty, syllabus_version)
     
     # Check if pool exists and is ready
     pool_status = get_pool_status(syllabus, class_level, subject, chapter, difficulty, syllabus_version)
@@ -159,6 +158,36 @@ def get_questions_from_pool(
         return list(questions)
 
 
+def get_questions_from_difficulty_pool(
+    syllabus: str,
+    class_level: int,
+    subject: str,
+    difficulty: str,
+    syllabus_version: str,
+    count: int,
+) -> list[PoolQuestion]:
+    """
+    Fetch questions from a difficulty-level Redis pool (shared across chapters).
+    Does not check per-chapter pool status; caller must enforce readiness.
+    """
+    redis_client = get_redis_client()
+    pool_key = get_pool_key(syllabus, class_level, subject, difficulty, syllabus_version)
+    question_ids = redis_client.lrange(pool_key, 0, count - 1)
+    available = len(question_ids)
+    if available == 0:
+        log.warning("pool_empty", pool_key=pool_key)
+        return []
+
+    with get_session() as session:
+        questions = session.exec(
+            select(PoolQuestion).where(PoolQuestion.id.in_(question_ids))
+        ).all()
+
+        redis_client.ltrim(pool_key, min(count, available), -1)
+        log.info("questions_fetched_from_pool", pool_key=pool_key, count=len(questions))
+        return list(questions)
+
+
 def add_questions_to_pool(
     pool_id: str,
     question_ids: list[str],
@@ -182,7 +211,6 @@ def add_questions_to_pool(
             pool.syllabus,
             pool.class_level,
             pool.subject,
-            pool.chapter,
             pool.difficulty,
             pool.syllabus_version,
         )
@@ -192,6 +220,24 @@ def add_questions_to_pool(
         # Shuffle and add to Redis list
         shuffled_ids = question_ids.copy()
         random.shuffle(shuffled_ids)
+
+        # Enforce requested_count cap if provided (do not exceed)
+        effective_requested = requested_count if requested_count is not None else pool.requested_count
+        current_generated = pool.generated_count or 0
+        if generated_count is not None:
+            current_generated = max(current_generated, generated_count)
+        if effective_requested is not None:
+            remaining = int(effective_requested) - int(current_generated)
+            if remaining <= 0:
+                log.info(
+                    "pool_generation_cap_reached",
+                    pool_id=pool.id,
+                    requested=effective_requested,
+                    generated=current_generated,
+                )
+                shuffled_ids = []
+            elif len(shuffled_ids) > remaining:
+                shuffled_ids = shuffled_ids[:remaining]
         
         if shuffled_ids:
             redis_client.rpush(pool_key, *shuffled_ids)
@@ -205,6 +251,8 @@ def add_questions_to_pool(
             pool.requested_count = requested_count
         if generated_count is not None:
             pool.generated_count = generated_count
+        elif shuffled_ids:
+            pool.generated_count = (pool.generated_count or 0) + len(shuffled_ids)
         if last_error is not None:
             pool.last_error = last_error
         session.add(pool)

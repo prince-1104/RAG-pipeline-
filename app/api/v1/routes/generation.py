@@ -15,6 +15,7 @@ from app.pools.service import (
     get_or_create_pool,
     get_pool_status,
     get_questions_from_pool,
+    get_questions_from_difficulty_pool,
     list_pool_chapters,
 )
 
@@ -108,6 +109,14 @@ def serve_from_pool(request: Request, req: PoolRequest):
     for difficulty, count in req.difficulty_mix.items():
         if count <= 0:
             continue
+        log.info(
+            "pool_request_difficulty_mix",
+            class_level=req.class_level,
+            subject=req.subject,
+            difficulty=difficulty,
+            target_count=count,
+            corpus_id=req.corpus_id,
+        )
         
         pool_info_by_chapter[difficulty] = {}
         pool_statuses: list[str] = []
@@ -134,32 +143,20 @@ def serve_from_pool(request: Request, req: PoolRequest):
             )
             pool_statuses.append(pool_status.value if pool_status else "pending")
 
-        for chapter in chapters:
-            if count_remaining <= 0:
-                break
-            pool_status = get_pool_status(
+        if any(status in (QuestionPoolStatus.ready.value, QuestionPoolStatus.ready_partial.value) for status in pool_statuses):
+            questions = get_questions_from_difficulty_pool(
                 syllabus=req.syllabus,
                 class_level=req.class_level,
                 subject=req.subject,
-                chapter=chapter,
                 difficulty=difficulty,
                 syllabus_version=req.syllabus_version,
+                count=count_remaining,
             )
-            if pool_status in (QuestionPoolStatus.ready, QuestionPoolStatus.ready_partial):
-                questions = get_questions_from_pool(
-                    syllabus=req.syllabus,
-                    class_level=req.class_level,
-                    subject=req.subject,
-                    chapter=chapter,
-                    difficulty=difficulty,
-                    syllabus_version=req.syllabus_version,
-                    count=count_remaining,
-                )
-                if questions:
-                    for pq in questions:
-                        q_data = json.loads(pq.question_json)
-                        all_questions.append(q_data)
-                    count_remaining -= len(questions)
+            if questions:
+                for pq in questions:
+                    q_data = json.loads(pq.question_json)
+                    all_questions.append(q_data)
+                count_remaining -= len(questions)
 
         if count_remaining <= 0:
             pool_info[difficulty] = next(iter(pool_info_by_chapter[difficulty].values()))
@@ -182,6 +179,7 @@ def serve_from_pool(request: Request, req: PoolRequest):
             difficulty=difficulty,
             syllabus_version=req.syllabus_version,
             chapters=chapters,
+            target_count=count,
         )
         pool_info[difficulty] = next(iter(pool_info_by_chapter[difficulty].values()))
     
@@ -211,6 +209,7 @@ def _trigger_pool_generation(
     difficulty: str,
     syllabus_version: str,
     chapters: list[str],
+    target_count: int,
 ) -> None:
     """Trigger background job to generate question pool."""
     with get_session() as session:
@@ -249,6 +248,7 @@ def _trigger_pool_generation(
                 "chapter": chapter,
                 "difficulty": difficulty,
                 "syllabus_version": syllabus_version,
+                "target_count": target_count,
             }
             job = GenerationJob(
                 kind=JobKind.generate_question_pool,

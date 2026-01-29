@@ -80,6 +80,12 @@ class Settings(BaseSettings):
     pool_generation_chunk_chars: int = 900
     pool_generation_min_absolute: int = 10
     pool_generation_min_fraction: float = 0.2
+    pool_generation_min_absolute_easy: int | None = None
+    pool_generation_min_absolute_medium: int | None = None
+    pool_generation_min_absolute_hard: int | None = None
+    pool_generation_min_fraction_easy: float | None = None
+    pool_generation_min_fraction_medium: float | None = None
+    pool_generation_min_fraction_hard: float | None = None
 
     # Admin generation performance tuning (per-class parallelism)
     admin_generate_max_concurrency: int = 2

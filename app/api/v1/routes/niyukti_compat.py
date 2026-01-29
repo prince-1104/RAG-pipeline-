@@ -10,7 +10,7 @@ from app.api.v1.schemas.niyukti_compat import (
     NiyuktiGenerateResponse,
     NiyuktiQuestionResponse,
 )
-from app.db.models import Corpus
+from app.db.models import Corpus, QuestionPoolStatus
 from app.db.session import get_session
 from app.generation.sync import generate_questions_sync
 from app.settings import get_settings
@@ -478,7 +478,7 @@ def get_pool_status_endpoint(
 
                 pool_status = pool.status.value if isinstance(pool.status, QuestionPoolStatus) else str(pool.status)
                 status_bucket.append(pool_status)
-                pool_key = get_pool_key(syllabus, class_level, mapped_subject, ch, difficulty, syllabus_version)
+                pool_key = get_pool_key(syllabus, class_level, mapped_subject, difficulty, syllabus_version)
                 redis_count = int(redis_client.llen(pool_key))
 
                 if redis_count == 0:
@@ -547,6 +547,7 @@ def _trigger_pool_generation(
     difficulty: str,
     syllabus_version: str,
     chapters: list[str],
+    target_count: int,
 ) -> None:
     """Trigger background job to generate question pool (LLM called in worker)."""
     import json
@@ -591,6 +592,7 @@ def _trigger_pool_generation(
                 "chapter": chapter,
                 "difficulty": difficulty,
                 "syllabus_version": syllabus_version,
+                "target_count": target_count,
             }
 
             # Create job - use enum value directly to avoid SQLAlchemy serialization issues
@@ -606,7 +608,12 @@ def _trigger_pool_generation(
             created += 1
         if created:
             session.commit()
-            log.info("pool_generation_jobs_created", difficulty=difficulty, count=created)
+            log.info(
+                "pool_generation_jobs_created",
+                difficulty=difficulty,
+                count=created,
+                target_count=target_count,
+            )
 
 
 def _convert_response_to_niyukti_format(
@@ -721,6 +728,13 @@ def _generate_questions_niyukti_impl(request: Request, req: NiyuktiGenerateReque
                     "medium": max(1, int(total * 0.4)),
                     "hard": max(0, total - int(total * 0.4) - int(total * 0.4)),
                 }
+        log.info(
+            "niyukti_generate_request_difficulty_mix",
+            class_level=req.class_level,
+            subject=mapped_subject,
+            difficulty_mix=difficulty_mix,
+            corpus_id=corpus_id,
+        )
         
         # STEP A: Check Redis (hot path)
         all_questions = []
@@ -735,15 +749,16 @@ def _generate_questions_niyukti_impl(request: Request, req: NiyuktiGenerateReque
             
             # Try to get questions from Redis pool
             from app.pools.service import (
-                get_questions_from_pool,
                 get_pool_status,
                 get_or_create_pool,
+                get_questions_from_difficulty_pool,
                 list_pool_chapters,
             )
 
             if chapters is None:
                 chapters = list_pool_chapters(corpus_id, req.class_level, mapped_subject)
             pool_info_by_chapter[difficulty] = {}
+            pool_statuses: list[str] = []
 
             count_remaining = count
             for chapter in chapters:
@@ -756,15 +771,21 @@ def _generate_questions_niyukti_impl(request: Request, req: NiyuktiGenerateReque
                     syllabus_version,
                 )
                 pool_info_by_chapter[difficulty][chapter] = pool.id
+                pool_status = get_pool_status(
+                    syllabus,
+                    req.class_level,
+                    mapped_subject,
+                    chapter,
+                    difficulty,
+                    syllabus_version,
+                )
+                pool_statuses.append(pool_status.value if pool_status else "pending")
             
-            for chapter in chapters:
-                if count_remaining <= 0:
-                    break
-                redis_questions = get_questions_from_pool(
+            if any(status in (QuestionPoolStatus.ready.value, QuestionPoolStatus.ready_partial.value) for status in pool_statuses):
+                redis_questions = get_questions_from_difficulty_pool(
                     syllabus=syllabus,
                     class_level=req.class_level,
                     subject=mapped_subject,
-                    chapter=chapter,
                     difficulty=difficulty,
                     syllabus_version=syllabus_version,
                     count=count_remaining,
@@ -816,7 +837,24 @@ def _generate_questions_niyukti_impl(request: Request, req: NiyuktiGenerateReque
                 pool_info[difficulty] = next(iter(pool_info_by_chapter[difficulty].values()))
 
                 # Trigger background pool generation
-                _trigger_pool_generation(corpus_id, syllabus, req.class_level, mapped_subject, difficulty, syllabus_version, chapters)
+                log.info(
+                    "niyukti_trigger_pool_generation",
+                    class_level=req.class_level,
+                    subject=mapped_subject,
+                    difficulty=difficulty,
+                    target_count=count,
+                    chapter_count=len(chapters),
+                )
+                _trigger_pool_generation(
+                    corpus_id,
+                    syllabus,
+                    req.class_level,
+                    mapped_subject,
+                    difficulty,
+                    syllabus_version,
+                    chapters,
+                    count,
+                )
         
         # Return response
         if all_questions and not needs_generation:
