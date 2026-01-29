@@ -6,7 +6,7 @@ from fastapi import APIRouter, HTTPException
 
 from app.api.v1.schemas.rag import RAGGenerateRequest, RAGGenerateResponse, RAGQuestionOut
 from app.observability.logging import log
-from app.rag.query.generate_questions import generate_questions
+from rag.query.generate_questions import generate_questions
 
 router = APIRouter()
 
