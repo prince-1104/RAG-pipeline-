@@ -14,7 +14,6 @@ structlog==24.4.0
 PyPDF2==3.0.1
 pdfplumber==0.11.5
 numpy>=1.22.4,<2.0
-sentence-transformers==3.3.1
 qdrant-client==1.16.2
 orjson==3.10.12
 jsonschema==4.23.0

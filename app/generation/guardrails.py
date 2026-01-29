@@ -9,7 +9,8 @@ from sqlmodel import select
 
 from app.db.models import GeneratedQuestion
 from app.db.session import get_session
-from app.indexing.embeddings import embed_texts
+from app.indexing.qdrant_index import embed_texts
+from app.observability.logging import log
 
 
 def dedupe_key_for(stem: str, qtype: str, chapter: str) -> str:
@@ -71,7 +72,11 @@ def reject_if_embedding_duplicate(
     if not stems:
         return None
 
-    embs = embed_texts([stem] + stems)
+    try:
+        embs = np.asarray(embed_texts([stem] + stems), dtype=np.float32)
+    except Exception as exc:
+        log.warning("guardrail_embedding_failed", error=str(exc))
+        return None
     qv = embs[0]
     mat = embs[1:]
     sims: np.ndarray = mat @ qv
