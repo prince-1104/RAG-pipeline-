@@ -1,34 +1,55 @@
 
+# Niyukti RAG Question Generation Engine
+
+RAG (Retrieval-Augmented Generation) question generation API for CBSE PDFs.
+
 ### 1) Setup environment
-
-
+```bash
 python -m venv .venv
-.\.venv\Scripts\activate  
-
+.\.venv\Scripts\activate
 pip install -r requirements.txt
 ```
-uvicorn app.main:app --host 0.0.0.0 --port 8080 --reload
-
-
-python -m app.worker
-
-
 
 ### 2) Configure environment
 Copy `.env.example` to `.env` in the project root directory and update with your values:
 ```bash
-# Required: Gemini API Key
-GEMINI_API_KEY=your_gemini_api_key_here
+# LLM Provider (see .env.example for valid modes)
+LLM_PROVIDER=openai_fallback_gemini
 
-# Required: PostgreSQL Database URL
+# OpenAI (primary)
+OPENAI_API_KEY=your_openai_api_key_here
+OPENAI_MODEL=gpt-4o-mini
+
+# Gemini (optional fallback)
+GEMINI_API_KEY=your_gemini_api_key_here
+GEMINI_MODEL=gemini-2.5-flash
+
+# Database
 DATABASE_URL=postgresql://user:password@host:port/database?sslmode=require
 
-# Optional: Other settings (defaults provided)
-LLM_PROVIDER=gemini
-STORAGE_BACKEND=local
-PDF_BASE_PATH=data/pdfs
+# Redis
+REDIS_URL=redis://localhost:6379
+
+# Storage (choose one)
+# Local:
+# STORAGE_BACKEND=local
+# PDF_BASE_PATH=data/pdfs
+# UPLOADS_BASE_PATH=.data/uploads
+# R2:
+STORAGE_BACKEND=r2
+R2_ACCOUNT_ID=your_r2_account_id
+R2_ENDPOINT_URL=https://your_account_id.r2.cloudflarestorage.com
+R2_BUCKET_NAME=your_bucket_name
+R2_ACCESS_KEY_ID=your_r2_access_key_id
+R2_SECRET_ACCESS_KEY=your_r2_secret_access_key
+R2_REGION=auto
+
+# Qdrant
 QDRANT_URL=http://localhost:6333
+QDRANT_API_KEY=your_qdrant_api_key_here
 QDRANT_COLLECTION=niyukti_knowledge
+
+# Embeddings
 EMBEDDING_API_KEY=your_openai_api_key_here
 ```
 
@@ -221,15 +242,17 @@ Set these in `.env`:
 - **No chunks in Qdrant**: Run indexing job first before generating questions
 
 ## Configuration
-Use `config/env.example` as a template. Create `.env` in the project root directory. Key variables:
+Use `.env.example` as a template. Create `.env` in the project root directory. Key variables:
 - `DATABASE_URL` - Postgres connection string
-- `STORAGE_BACKEND=local` - Use local PDF mode (no S3)
-- `PDF_BASE_PATH` - Where CBSE PDFs are stored
+- `REDIS_URL` - Redis connection string
+- `STORAGE_BACKEND=local|r2` - Storage backend
+- `PDF_BASE_PATH` - Local PDF path (when using `local`)
 - `QDRANT_URL` - Qdrant connection string
 - `QDRANT_COLLECTION` - Qdrant collection name
 - `EMBEDDING_API_KEY` - OpenAI embeddings key for indexing/retrieval
-- `LLM_PROVIDER=stub|gemini` - LLM provider (stub for testing)
-- `GEMINI_API_KEY` - Required if `LLM_PROVIDER=gemini`
+- `LLM_PROVIDER` - LLM provider mode (see `.env.example`)
+- `OPENAI_API_KEY` - Required for OpenAI usage
+- `GEMINI_API_KEY` - Required for Gemini usage
 
 ## Documentation
 Internal documentation is maintained outside this repository.
