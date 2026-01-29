@@ -12,7 +12,6 @@ from app.api.v1.schemas.niyukti_compat import (
 )
 from app.db.models import Corpus, QuestionPoolStatus
 from app.db.session import get_session
-from app.generation.sync import generate_questions_sync
 from app.settings import get_settings
 
 # Import ingest functionality
@@ -65,7 +64,7 @@ async def ingest_pdf_niyukti(
     Automatically triggers indexing pipeline:
     - Uploads PDF to R2
     - Creates Document record
-    - Enqueues index job (chunking → embedding → FAISS index)
+    - Runs Qdrant indexing (chunking → embedding → Qdrant upsert)
     
     Returns index_job_id for tracking progress via GET /api/v1/jobs/{index_job_id}
     """
@@ -539,83 +538,6 @@ def get_pool_status_endpoint(
     )
 
 
-def _trigger_pool_generation(
-    corpus_id: str,
-    syllabus: str,
-    class_level: int,
-    subject: str,
-    difficulty: str,
-    syllabus_version: str,
-    chapters: list[str],
-    target_count: int,
-) -> None:
-    """Trigger background job to generate question pool (LLM called in worker)."""
-    import json
-    from app.db.models import GenerationJob, JobKind, JobStatus
-    from app.observability.logging import log
-    
-    with get_session() as session:
-        # Check if job already exists
-        from sqlmodel import select
-        # Now that enum values are lowercase, direct comparison should work
-        existing_jobs = session.exec(
-            select(GenerationJob).where(
-                GenerationJob.kind == JobKind.generate_question_pool,
-                GenerationJob.corpus_id == corpus_id,
-                GenerationJob.status.in_([JobStatus.queued, JobStatus.running]),
-            )
-        ).all()
-        
-        queued: set[str] = set()
-        for job in existing_jobs:
-            if job.status in [JobStatus.queued, JobStatus.running]:
-                try:
-                    job_data = json.loads(job.request_json)
-                    if (job_data.get("syllabus") == syllabus and
-                        job_data.get("class_level") == class_level and
-                        job_data.get("subject") == subject and
-                        job_data.get("difficulty") == difficulty and
-                        job_data.get("syllabus_version") == syllabus_version):
-                        queued.add(job_data.get("chapter") or "Unknown Chapter")
-                except Exception:
-                    continue
-        
-        created = 0
-        for chapter in chapters:
-            if chapter in queued:
-                continue
-            job_data = {
-                "corpus_id": corpus_id,
-                "syllabus": syllabus,
-                "class_level": class_level,
-                "subject": subject,
-                "chapter": chapter,
-                "difficulty": difficulty,
-                "syllabus_version": syllabus_version,
-                "target_count": target_count,
-            }
-
-            # Create job - use enum value directly to avoid SQLAlchemy serialization issues
-            # SQLAlchemy with native_enum=False should use enum.value, but we'll ensure it explicitly
-            job = GenerationJob(
-                kind=JobKind.generate_question_pool,
-                status=JobStatus.queued,
-                tenant_id="system",
-                corpus_id=corpus_id,
-                request_json=json.dumps(job_data),
-            )
-            session.add(job)
-            created += 1
-        if created:
-            session.commit()
-            log.info(
-                "pool_generation_jobs_created",
-                difficulty=difficulty,
-                count=created,
-                target_count=target_count,
-            )
-
-
 def _convert_response_to_niyukti_format(
     response: GenerateResponse, class_level: int, subject: str
 ) -> NiyuktiGenerateResponse:
@@ -832,29 +754,9 @@ def _generate_questions_niyukti_impl(request: Request, req: NiyuktiGenerateReque
                         count_remaining -= len(db_questions)
 
             if count_remaining > 0:
-                # STEP C: Trigger background job (ONLY enqueue)
+                # STEP C: Do NOT trigger generation for institute requests
                 needs_generation = True
                 pool_info[difficulty] = next(iter(pool_info_by_chapter[difficulty].values()))
-
-                # Trigger background pool generation
-                log.info(
-                    "niyukti_trigger_pool_generation",
-                    class_level=req.class_level,
-                    subject=mapped_subject,
-                    difficulty=difficulty,
-                    target_count=count,
-                    chapter_count=len(chapters),
-                )
-                _trigger_pool_generation(
-                    corpus_id,
-                    syllabus,
-                    req.class_level,
-                    mapped_subject,
-                    difficulty,
-                    syllabus_version,
-                    chapters,
-                    count,
-                )
         
         # Return response
         if all_questions and not needs_generation:

@@ -47,9 +47,10 @@ class APIKeyMiddleware(BaseHTTPMiddleware):
             "/favicon.ico",
         ]
         
-        # Skip authentication for paths that don't start with /v1 or /api/v1
+        # Skip authentication for paths that don't start with protected prefixes
         path = request.url.path
-        if path in skip_paths or not (path.startswith("/v1/") or path.startswith("/api/v1/")):
+        protected_prefixes = ("/v1/", "/api/v1/", "/rag/")
+        if path in skip_paths or not path.startswith(protected_prefixes):
             return await call_next(request)
         
         # If no API keys configured, skip authentication

@@ -27,7 +27,9 @@ DATABASE_URL=postgresql://user:password@host:port/database?sslmode=require
 LLM_PROVIDER=gemini
 STORAGE_BACKEND=local
 PDF_BASE_PATH=data/pdfs
-INDEX_BASE_PATH=data/indexes
+QDRANT_URL=http://localhost:6333
+QDRANT_COLLECTION=niyukti_knowledge
+EMBEDDING_API_KEY=your_openai_api_key_here
 ```
 
 **Important:** Never commit the `.env` file to git. It contains sensitive credentials.
@@ -137,9 +139,9 @@ curl -X POST http://localhost:8080/api/v1/corpora/{CORPUS_ID}/index-jobs \
 curl http://localhost:8080/api/v1/jobs/{JOB_ID}
 ```
 
-### 9) Generate questions
+### 9) Generate questions (pools)
 ```bash
-curl -X POST http://localhost:8080/api/v1/generation/sync \
+curl -X POST http://localhost:8080/v1/question-generation/pools \
   -H "Content-Type: application/json" \
   -d '{
     "tenant_id": "test-tenant",
@@ -158,6 +160,8 @@ curl -X POST http://localhost:8080/api/v1/generation/sync \
 
 ### 10) Open API docs
 - `http://localhost:8080/docs`
+
+**Note:** `/rag/*` endpoints are internal/admin-only and require API key auth.
 
 ## Running in Local PDF Mode
 
@@ -188,13 +192,6 @@ niyukti-que-gen-Engine/
 │   │           ├── Social Science/
 │   │           ├── Mathematics/
 │   │           └── Science/
-│   └── indexes/          # FAISS indices (auto-generated)
-│       └── {corpus_id}/
-│           └── class_{N}/
-│               └── {subject}/
-│                   ├── index.faiss
-│                   ├── meta.json
-│                   └── vecs.npy
 ├── .data/
 │   └── uploads/          # Future uploads (if needed)
 ├── config/
@@ -205,42 +202,36 @@ niyukti-que-gen-Engine/
 ### Key Points
 - **PDFs are NOT uploaded**: They must exist at `data/pdfs/cbse/{class}/{subject}/{filename}` before registration
 - **PDFs are read-only**: The service never modifies source PDFs
-- **Indices are persisted**: FAISS indices are saved to `data/indexes/` and survive restarts
+- **Qdrant is required**: All embeddings are stored in Qdrant (local or managed)
 - **Path traversal protection**: The service rejects any PDF paths outside `PDF_BASE_PATH`
 
 ### Configuration
 Set these in `.env`:
 - `STORAGE_BACKEND=local` (required for local mode)
 - `PDF_BASE_PATH=data/pdfs` (where CBSE PDFs live)
-- `INDEX_BASE_PATH=data/indexes` (where FAISS indices are stored)
+- `QDRANT_URL=http://localhost:6333` (local Qdrant)
+- `QDRANT_COLLECTION=niyukti_knowledge`
+- `EMBEDDING_API_KEY=...` (OpenAI embeddings)
 - `DATABASE_URL=...` (Postgres connection string)
 
 ### Failure Modes
 - **PDF not found**: Check that the file exists at `data/pdfs/cbse/{class}/{subject}/{filename}`
 - **Invalid PDF**: File must start with `%PDF` header
 - **Path traversal**: Filename cannot contain `/`, `\`, or start with `.`
-- **Index not found**: Run indexing job first before generating questions
+- **No chunks in Qdrant**: Run indexing job first before generating questions
 
 ## Configuration
 Use `config/env.example` as a template. Create `.env` in the project root directory. Key variables:
 - `DATABASE_URL` - Postgres connection string
 - `STORAGE_BACKEND=local` - Use local PDF mode (no S3)
 - `PDF_BASE_PATH` - Where CBSE PDFs are stored
-- `INDEX_BASE_PATH` - Where FAISS indices are persisted
+- `QDRANT_URL` - Qdrant connection string
+- `QDRANT_COLLECTION` - Qdrant collection name
+- `EMBEDDING_API_KEY` - OpenAI embeddings key for indexing/retrieval
 - `LLM_PROVIDER=stub|gemini` - LLM provider (stub for testing)
 - `GEMINI_API_KEY` - Required if `LLM_PROVIDER=gemini`
 
-## Key docs
-- **[Comprehensive Documentation](docs/COMPREHENSIVE_DOCUMENTATION.md)** - Complete feature documentation and roadmap
-- **[Features Summary](docs/FEATURES_SUMMARY.md)** - Quick reference of implemented and planned features
-- `docs/architecture.md` - System architecture details
-- `docs/api-contract.md` - API endpoint specifications
-- `docs/data-model.md` - Database schema documentation
-- `docs/rag-design.md` - RAG pipeline design
-- `docs/question-blueprint.md` - Question blueprint structure
-- `docs/prompting-gemini.md` - Prompt engineering details
-- `docs/guardrails.md` - Quality control mechanisms
-- `docs/ops.md` - Operations and deployment guide
-- `POSTMAN_TESTING_GUIDE.md` - API testing guide
+## Documentation
+Internal documentation is maintained outside this repository.
 
 

@@ -30,19 +30,17 @@ RAG (Retrieval-Augmented Generation) Question Generation Engine for CBSE curricu
   - Database migrations with Alembic
 
 ### **Vector Database & Similarity Search**
-- **FAISS** (Facebook AI Similarity Search) - CPU version (v1.9.0.post1)
+- **Qdrant** (managed or local)
   - Vector similarity search for RAG retrieval
-  - Index type: `IndexFlatIP` (Inner Product for cosine similarity)
-  - Stores embeddings on disk per corpus/class/subject
-  - Fast approximate nearest neighbor search
+  - Stores embeddings and payload metadata in a single source of truth
+  - Supports filtering by corpus/class/subject/chapter
 
 ### **Embedding Model**
+- **OpenAI Embeddings API**
+  - **Model**: `text-embedding-ada-002` (1536 dimensions)
+  - Used for Qdrant indexing and retrieval
 - **Sentence Transformers** (v3.3.1)
-  - Library for generating text embeddings
-  - **Model**: `sentence-transformers/all-MiniLM-L6-v2` (default)
-    - 384-dimensional embeddings
-    - Optimized for semantic similarity
-    - Normalized embeddings for cosine similarity
+  - Used for local duplicate-guardrail embeddings
 
 ### **LLM (Large Language Model) Providers**
 Supports multiple providers via unified interface:
@@ -72,7 +70,6 @@ Supports multiple providers via unified interface:
 - **NumPy** (v1.22.4+)
   - Vector operations
   - Embedding array handling
-  - FAISS integration
 
 ### **Configuration & Settings**
 - **Pydantic Settings** (v2.7.0)
@@ -128,12 +125,10 @@ Supports multiple providers via unified interface:
 
 ## 🗂️ Storage
 
-### **Local File Storage** (Current)
+### **Local File Storage**
 - File system storage for PDFs
-- Local index storage (FAISS indices)
 - Configurable base paths:
   - `PDF_BASE_PATH`: PDF storage
-  - `INDEX_BASE_PATH`: FAISS index storage
   - `UPLOADS_BASE_PATH`: Uploaded files
 
 ---
@@ -189,8 +184,8 @@ Supports multiple providers via unified interface:
 |----------|-----------|
 | **API Framework** | FastAPI + Uvicorn |
 | **Database** | PostgreSQL + SQLModel |
-| **Vector Search** | FAISS (CPU) |
-| **Embeddings** | Sentence Transformers (all-MiniLM-L6-v2) |
+| **Vector Search** | Qdrant |
+| **Embeddings** | OpenAI Embeddings API |
 | **LLM** | OpenRouter (OpenAI GPT-4o-mini) / Gemini |
 | **PDF Parsing** | pdfplumber + PyPDF2 |
 | **Logging** | Structlog |
@@ -208,18 +203,17 @@ Supports multiple providers via unified interface:
 
 1. **PDF Upload** → pdfplumber extracts text
 2. **Chunking** → Syllabus-aware chunking creates text chunks
-3. **Embedding** → Sentence Transformers generates vector embeddings
-4. **Indexing** → FAISS creates similarity search index
-5. **Storage** → PostgreSQL stores metadata, FAISS stores vectors
-6. **Retrieval** → Query → Embed → FAISS search → Retrieve chunks
+3. **Embedding** → OpenAI embeddings generate vector embeddings
+4. **Indexing** → Qdrant upsert with payload metadata
+5. **Storage** → PostgreSQL stores metadata, Qdrant stores vectors
+6. **Retrieval** → Query → Embed → Qdrant search → Retrieve chunks
 7. **Generation** → LLM (OpenRouter/Gemini) generates questions from retrieved context
 
 ---
 
 ## 📝 Notes
 
-- **Embedding Dimension**: 384 (all-MiniLM-L6-v2)
-- **Similarity Metric**: Cosine similarity (via Inner Product)
-- **Index Type**: Flat Index (exact search, suitable for moderate dataset sizes)
+- **Embedding Dimension**: 1536 (text-embedding-ada-002)
+- **Similarity Metric**: Cosine similarity (Qdrant)
 - **Default LLM**: OpenAI GPT-4o-mini via OpenRouter
 - **Storage Backend**: Local file system (can be extended to S3/cloud storage)

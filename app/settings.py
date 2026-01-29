@@ -20,7 +20,6 @@ class Settings(BaseSettings):
     # Storage (local PDF mode or R2)
     storage_backend: Literal["local", "r2"] = "local"
     pdf_base_path: str = "data/pdfs"
-    index_base_path: str = "data/indexes"
     uploads_base_path: str = ".data/uploads"
     
     # Cloudflare R2 configuration (S3-compatible)

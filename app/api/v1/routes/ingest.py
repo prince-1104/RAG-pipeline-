@@ -13,6 +13,7 @@ from app.db.session import get_session
 from app.observability.logging import log
 from app.settings import get_settings
 from app.storage.object_store import get_object_store
+from app.indexing.qdrant_pipeline import index_document_qdrant
 
 router = APIRouter()
 
@@ -67,7 +68,7 @@ async def ingest_pdf(
     Workflow:
     1. Upload PDF to R2
     2. Create Document record
-    3. Enqueue index job (chunking → embedding → FAISS index)
+    3. Run Qdrant indexing (chunking → embedding → Qdrant upsert)
     """
     # Default tenant_id for Niyukti
     if not tenant_id:
@@ -187,13 +188,14 @@ async def ingest_pdf(
                     job.corpus_id = corpus_id
                     session.commit()
             
-            # Create index job
+            # Create index job and run Qdrant indexing immediately
             with get_session() as session:
                 index_job = GenerationJob(
                     kind=JobKind.index,
-                    status=JobStatus.queued,
+                    status=JobStatus.running,
                     tenant_id=tenant_id,
                     corpus_id=corpus_id,
+                    started_at=datetime.utcnow(),
                     request_json=json.dumps({
                         "document_ids": [document_id],
                     }),
@@ -205,6 +207,33 @@ async def ingest_pdf(
                 if not index_job.corpus_id:
                     log.error("index_job_missing_corpus_id", index_job_id=index_job_id, tenant_id=tenant_id)
                     raise HTTPException(status_code=500, detail="index_job_missing_corpus_id")
+
+            # Run indexing synchronously (Qdrant-only)
+            try:
+                chunks_indexed = index_document_qdrant(document=document)
+                with get_session() as session:
+                    db_job = session.get(GenerationJob, index_job_id)
+                    if db_job:
+                        db_job.status = JobStatus.succeeded
+                        db_job.finished_at = datetime.utcnow()
+                        db_job.result_json = json.dumps({
+                            "ok": True,
+                            "document_id": document_id,
+                            "chunks_indexed": chunks_indexed,
+                        })
+                        session.commit()
+            except Exception as e:
+                error_msg = str(e)
+                log.error("index_job_failed", index_job_id=index_job_id, error=error_msg)
+                with get_session() as session:
+                    db_job = session.get(GenerationJob, index_job_id)
+                    if db_job:
+                        db_job.status = JobStatus.failed
+                        db_job.finished_at = datetime.utcnow()
+                        db_job.error_code = "INDEX_FAILED"
+                        db_job.error_message = error_msg
+                        session.commit()
+                raise HTTPException(status_code=500, detail=f"indexing_failed:{error_msg}") from e
 
             # Mark ingest job as succeeded
             with get_session() as session:
@@ -267,7 +296,7 @@ async def ingest_pdf(
         except HTTPException as e:
             error_msg = str(e.detail)
             log.error(
-                "ingest_corpus_error",
+                "ingest_error",
                 doc_id=doc_id,
                 error=error_msg,
                 job_id=job_id,
@@ -278,7 +307,7 @@ async def ingest_pdf(
                     if job:
                         job.status = JobStatus.failed
                         job.finished_at = datetime.utcnow()
-                        job.error_code = "corpus_error"
+                        job.error_code = "ingest_error"
                         job.error_message = error_msg
                         session.commit()
             raise

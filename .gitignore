@@ -28,6 +28,9 @@ data/
 *.sqlite
 *.sqlite3
 
+# Docs
+docs/
+
 # Environment
 .env
 .env.local
