@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import time
 from typing import Iterable
 
-import httpx
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
     FieldCondition,
@@ -10,64 +10,50 @@ from qdrant_client.models import (
     FilterSelector,
     MatchValue,
     PointStruct,
+    PayloadSchemaType,
 )
 
 from app.db.models import Chunk, Corpus, Document
+from app.embeddings.factory import get_embedding_client
 from app.observability.logging import log
 from app.settings import get_settings
 
-EMBEDDING_MODEL = "text-embedding-ada-002"
-EMBEDDING_DIM = 1536
 EMBEDDING_BATCH_SIZE = 64
-
-
-def _get_embedding_api_key() -> str:
-    settings = get_settings()
-    api_key = settings.embedding_api_key or settings.openai_api_key
-    if not api_key or not str(api_key).strip():
-        raise RuntimeError("missing_embedding_api_key")
-    return str(api_key).strip()
 
 
 def embed_texts(texts: list[str]) -> list[list[float]]:
     if not texts:
         return []
-    api_key = _get_embedding_api_key()
-    payload = {"model": EMBEDDING_MODEL, "input": texts}
-    with httpx.Client(timeout=60.0) as client:
-        resp = client.post(
-            "https://api.openai.com/v1/embeddings",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-        )
-    if resp.status_code != 200:
-        err_body = (resp.text or "")[:500]
-        raise RuntimeError(f"embedding_api_failed status={resp.status_code} body={err_body}")
-    data = resp.json()
-    items = data.get("data")
-    if not isinstance(items, list):
-        raise RuntimeError("embedding_api_invalid_response_shape")
-    # Preserve order by index
-    by_idx: dict[int, list[float]] = {}
-    for item in items:
-        idx = item.get("index")
-        vec = item.get("embedding")
-        if idx is None or not isinstance(vec, list):
-            raise RuntimeError("embedding_api_invalid_item")
-        if len(vec) != EMBEDDING_DIM:
-            raise RuntimeError(
-                f"embedding_dimension_mismatch expected={EMBEDDING_DIM} got={len(vec)}"
+    settings = get_settings()
+    provider = settings.embedding_provider
+    client = get_embedding_client()
+    max_attempts = 3
+    delay_s = 0.5
+
+    for attempt in range(1, max_attempts + 1):
+        start = time.perf_counter()
+        try:
+            vectors = client.embed(texts)
+            duration_ms = int((time.perf_counter() - start) * 1000)
+            log.info(
+                "embedding_batch_complete",
+                provider=provider,
+                batch_size=len(texts),
+                duration_ms=duration_ms,
             )
-        by_idx[int(idx)] = [float(x) for x in vec]
-    out: list[list[float]] = []
-    for i in range(len(texts)):
-        if i not in by_idx:
-            raise RuntimeError(f"embedding_missing_index:{i}")
-        out.append(by_idx[i])
-    return out
+            return vectors
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "embedding_batch_failed",
+                provider=provider,
+                batch_size=len(texts),
+                attempt=attempt,
+                error=str(exc),
+            )
+            if attempt == max_attempts:
+                raise
+            time.sleep(delay_s)
+            delay_s *= 2
 
 
 def get_qdrant_client() -> QdrantClient:
@@ -77,6 +63,67 @@ def get_qdrant_client() -> QdrantClient:
         api_key=settings.qdrant_api_key,
         timeout=settings.qdrant_timeout_s,
     )
+
+
+def ensure_qdrant_payload_indexes() -> None:
+    """
+    Ensure Qdrant payload indexes exist for all filterable fields.
+    Fail fast if we cannot create required indexes.
+    """
+    settings = get_settings()
+    client = get_qdrant_client()
+
+    required = {
+        "document_id": PayloadSchemaType.KEYWORD,
+        "corpus_id": PayloadSchemaType.KEYWORD,
+        "tenant_id": PayloadSchemaType.KEYWORD,
+        "board": PayloadSchemaType.KEYWORD,
+        "syllabus": PayloadSchemaType.KEYWORD,
+        "syllabus_version": PayloadSchemaType.KEYWORD,
+        "class_level": PayloadSchemaType.INTEGER,
+        "subject": PayloadSchemaType.KEYWORD,
+        "chapter": PayloadSchemaType.KEYWORD,
+    }
+
+    collection = client.get_collection(collection_name=settings.qdrant_collection)
+    payload_schema = getattr(collection, "payload_schema", None) or {}
+    existing = set(payload_schema.keys()) if isinstance(payload_schema, dict) else set()
+
+    missing = {field: schema for field, schema in required.items() if field not in existing}
+    for field_name, field_schema in missing.items():
+        client.create_payload_index(
+            collection_name=settings.qdrant_collection,
+            field_name=field_name,
+            field_schema=field_schema,
+        )
+        log.info(
+            "qdrant_payload_index_created",
+            collection=settings.qdrant_collection,
+            field_name=field_name,
+            field_schema=str(field_schema),
+        )
+
+    if missing:
+        # Re-check to fail fast if index creation did not stick
+        collection = client.get_collection(collection_name=settings.qdrant_collection)
+        payload_schema = getattr(collection, "payload_schema", None) or {}
+        existing = set(payload_schema.keys()) if isinstance(payload_schema, dict) else set()
+        still_missing = [field for field in required.keys() if field not in existing]
+        if still_missing:
+            raise RuntimeError(f"qdrant_payload_index_missing:{','.join(still_missing)}")
+
+    vector_params = getattr(collection.config.params, "vectors", None)
+    vector_size = None
+    if hasattr(vector_params, "size"):
+        vector_size = vector_params.size
+    elif isinstance(vector_params, dict) and vector_params:
+        any_params = next(iter(vector_params.values()))
+        vector_size = getattr(any_params, "size", None)
+
+    if vector_size and vector_size != settings.embedding_dim:
+        raise RuntimeError(
+            f"qdrant_vector_dim_mismatch expected={settings.embedding_dim} got={vector_size}"
+        )
 
 
 def delete_document_points(*, document_id: str) -> None:

@@ -9,6 +9,7 @@ from sqlmodel import select
 from app.db.models import GenerationJob, JobKind, JobStatus
 from app.db.session import get_session, init_db
 from app.indexing.index_job import run_index_job
+from app.indexing.qdrant_index import ensure_qdrant_payload_indexes
 from app.observability.logging import configure_logging, log
 from app.settings import get_settings
 from app.tasks.admin_generate_job import run_admin_generate_job
@@ -69,6 +70,7 @@ def run_forever() -> None:
     settings = get_settings()
     configure_logging(settings.log_level)
     init_db()
+    ensure_qdrant_payload_indexes()
     log.info("worker_started", env=settings.env)
 
     while True:

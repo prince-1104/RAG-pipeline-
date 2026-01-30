@@ -4,6 +4,7 @@ import hashlib
 import re
 from dataclasses import dataclass
 
+from app.indexing.chunker import count_tokens, hard_token_split
 from app.indexing.pdf_parse import PageText
 
 
@@ -53,6 +54,7 @@ def syllabus_aware_chunk(
     toc: list[dict] | None,
     max_chars: int = 1800,
     overlap_chars: int = 250,
+    max_tokens: int | None = None,
 ) -> list[ChunkOut]:
     """
     Syllabus-aware chunking:
@@ -61,7 +63,7 @@ def syllabus_aware_chunk(
     - Chunk *within* a chapter using paragraph-ish boundaries, not fixed tokens
     """
     if toc:
-        return _chunk_by_toc(
+        out = _chunk_by_toc(
             pages=pages,
             class_level=class_level,
             subject=subject,
@@ -69,13 +71,44 @@ def syllabus_aware_chunk(
             max_chars=max_chars,
             overlap_chars=overlap_chars,
         )
-    return _chunk_by_heading(
+    else:
+        out = _chunk_by_heading(
         pages=pages,
         class_level=class_level,
         subject=subject,
         max_chars=max_chars,
         overlap_chars=overlap_chars,
     )
+    if max_tokens:
+        return _cap_chunks_by_tokens(out, max_tokens=max_tokens)
+    return out
+
+
+def _cap_chunks_by_tokens(chunks: list[ChunkOut], max_tokens: int) -> list[ChunkOut]:
+    if max_tokens <= 0:
+        return chunks
+    capped: list[ChunkOut] = []
+    for ch in chunks:
+        if count_tokens(ch.text) <= max_tokens:
+            capped.append(ch)
+            continue
+        for piece in hard_token_split(ch.text, max_tokens=max_tokens):
+            norm = _normalize_ws(piece)
+            if len(norm) < 200:
+                continue
+            capped.append(
+                ChunkOut(
+                    class_level=ch.class_level,
+                    subject=ch.subject,
+                    chapter=ch.chapter,
+                    page_start=ch.page_start,
+                    page_end=ch.page_end,
+                    text=norm,
+                    text_hash=_hash_text(norm),
+                    topics=_topics_from_text(piece),
+                )
+            )
+    return capped
 
 
 def _chunk_text(text: str, max_chars: int, overlap_chars: int) -> list[str]:

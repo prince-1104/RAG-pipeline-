@@ -17,6 +17,7 @@ from app.api.v1.router import router as v1_router
 from app.db.session import init_db
 from app.observability.logging import configure_logging, log
 from app.observability.metrics import metrics_router, observe_request
+from app.indexing.qdrant_index import ensure_qdrant_payload_indexes
 from app.observability.rate_limit import limiter
 from app.settings import get_settings
 
@@ -142,6 +143,7 @@ def create_app() -> FastAPI:
     @app.on_event("startup")
     def _startup() -> None:
         init_db()
+        ensure_qdrant_payload_indexes()
         log.info("startup_complete", env=settings.env, provider=settings.llm_provider)
 
     app.include_router(metrics_router, include_in_schema=False)

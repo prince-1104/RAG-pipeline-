@@ -121,6 +121,11 @@ def _hard_token_split(text: str, max_tokens: int) -> list[str]:
     return out
 
 
+def hard_token_split(text: str, max_tokens: int) -> list[str]:
+    """Public wrapper for token-based hard splitting."""
+    return _hard_token_split(text, max_tokens=max_tokens)
+
+
 def _paragraph_to_units(paragraph: str, max_tokens: int) -> list[str]:
     """
     Convert a paragraph into one or more units where each unit <= max_tokens.

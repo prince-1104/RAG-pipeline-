@@ -13,7 +13,7 @@ from app.db.session import get_session
 from app.observability.logging import log
 from app.settings import get_settings
 from app.storage.object_store import get_object_store
-from app.indexing.qdrant_pipeline import index_document_qdrant
+from app.indexing.qdrant_pipeline import index_document_qdrant_async
 
 router = APIRouter()
 
@@ -120,6 +120,7 @@ async def ingest_pdf(
 
     # Create ingestion job to track status
     job = None
+    job_id = None
     storage_uri = None
     document_id = None
     index_job_id = None
@@ -210,7 +211,7 @@ async def ingest_pdf(
 
             # Run indexing synchronously (Qdrant-only)
             try:
-                chunks_indexed = index_document_qdrant(document=document)
+                chunks_indexed = await index_document_qdrant_async(document_id=document_id)
                 with get_session() as session:
                     db_job = session.get(GenerationJob, index_job_id)
                     if db_job:
@@ -233,7 +234,36 @@ async def ingest_pdf(
                         db_job.error_code = "INDEX_FAILED"
                         db_job.error_message = error_msg
                         session.commit()
-                raise HTTPException(status_code=500, detail=f"indexing_failed:{error_msg}") from e
+
+                    # Mark ingest job as failed but keep uploaded document for retry
+                    ingest_job = session.get(GenerationJob, job_id)
+                    if ingest_job:
+                        ingest_job.status = JobStatus.failed
+                        ingest_job.finished_at = datetime.utcnow()
+                        ingest_job.error_code = "INDEX_FAILED"
+                        ingest_job.error_message = error_msg
+                        ingest_job.result_json = json.dumps({
+                            "ok": False,
+                            "uploaded_not_indexed": True,
+                            "storage_uri": storage_uri,
+                            "doc_id": doc_id,
+                            "document_id": document_id,
+                            "index_job_id": index_job_id,
+                            "corpus_id": corpus_id,
+                            "index_error": error_msg,
+                        })
+                        session.commit()
+
+                return PDFIngestResponse(
+                    success=False,
+                    doc_id=doc_id,
+                    corpus_id=corpus_id,
+                    storage_uri=storage_uri,
+                    job_id=job_id,
+                    index_job_id=index_job_id,
+                    document_id=document_id,
+                    error=f"indexing_failed:{error_msg}",
+                )
 
             # Mark ingest job as succeeded
             with get_session() as session:
@@ -339,10 +369,10 @@ async def ingest_pdf(
             error=str(e),
         )
         # Try to mark job as failed if it was created
-        if job and job.id:
+        if job_id:
             try:
                 with get_session() as session:
-                    db_job = session.get(GenerationJob, job.id)
+                    db_job = session.get(GenerationJob, job_id)
                     if db_job:
                         db_job.status = JobStatus.failed
                         db_job.finished_at = datetime.utcnow()
@@ -362,10 +392,10 @@ async def ingest_pdf(
             error=str(e),
             error_type=type(e).__name__,
         )
-        if job and job.id:
+        if job_id:
             try:
                 with get_session() as session:
-                    db_job = session.get(GenerationJob, job.id)
+                    db_job = session.get(GenerationJob, job_id)
                     if db_job:
                         db_job.status = JobStatus.failed
                         db_job.finished_at = datetime.utcnow()

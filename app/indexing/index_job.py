@@ -59,7 +59,7 @@ def run_index_job(job: GenerationJob) -> None:
     total_chunks = 0
 
     for doc_idx, doc in enumerate(docs):
-        produced_count = index_document_qdrant(document=doc)
+        produced_count = index_document_qdrant(document_id=doc.id)
         total_chunks += produced_count
         
         # Update progress after each document

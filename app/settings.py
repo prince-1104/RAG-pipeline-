@@ -43,6 +43,11 @@ class Settings(BaseSettings):
     redis_socket_connect_timeout: float = 5.0
 
     embedding_model_name: str = "sentence-transformers/all-MiniLM-L6-v2"
+    embedding_provider: Literal["openai", "together"] = "openai"
+    embedding_model: str = "text-embedding-ada-002"
+    embedding_dim: int = 1536
+    embedding_max_tokens: int = 512
+    together_api_key: str | None = None
 
     llm_provider: str = "stub"
     gemini_api_key: str | None = None

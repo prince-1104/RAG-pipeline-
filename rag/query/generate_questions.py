@@ -40,18 +40,13 @@ from __future__ import annotations
 import json
 from typing import Any, Literal
 
-import httpx
 from qdrant_client import QdrantClient
 from qdrant_client.models import FieldCondition, Filter, MatchValue
 
+from app.embeddings.factory import get_embedding_client
 from app.observability.logging import log
 from app.settings import get_settings
 
-
-# Same as indexing pipeline (rag/ingest/indexing_worker)
-OPENAI_EMBEDDING_URL = "https://api.openai.com/v1/embeddings"
-EMBEDDING_MODEL = "text-embedding-ada-002"
-EMBEDDING_DIM = 1536
 
 TOP_K_MIN = 12
 TOP_K_MAX = 20
@@ -68,54 +63,22 @@ QuestionType = Literal["mcq", "descriptive"]
 
 def embed_query(query: str) -> list[float]:
     """
-    Generate a single 1536-dim query embedding via OpenAI Embeddings API.
-    Uses same model as indexing (text-embedding-ada-002). Single embedding call.
+    Generate a single query embedding via configured provider.
 
     Raises:
-        ValueError: if EMBEDDING_API_KEY is missing.
-        RuntimeError: on API failure.
+        RuntimeError: on embedding failure.
     """
+    client = get_embedding_client()
     settings = get_settings()
-    api_key = getattr(settings, "embedding_api_key", None) or getattr(
-        settings, "openrouter_api_key", None
-    )
-    if not api_key or not str(api_key).strip():
-        raise ValueError(
-            "embedding_api_key or EMBEDDING_API_KEY required for runtime RAG"
-        )
-
-    payload: dict[str, Any] = {
-        "model": EMBEDDING_MODEL,
-        "input": [query],
-    }
-
-    with httpx.Client(timeout=30.0) as client:
-        resp = client.post(
-            OPENAI_EMBEDDING_URL,
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-        )
-
-    if resp.status_code != 200:
-        err_body = (resp.text or "")[:500]
+    vectors = client.embed([query])
+    if len(vectors) != 1:
+        raise RuntimeError("embedding_query_unexpected_vector_count")
+    vec = vectors[0]
+    if settings.embedding_dim and len(vec) != settings.embedding_dim:
         raise RuntimeError(
-            f"Embedding API failed: status={resp.status_code} body={err_body}"
+            f"embedding_dimension_mismatch expected={settings.embedding_dim} got={len(vec)}"
         )
-
-    data = resp.json()
-    items = data.get("data")
-    if not isinstance(items, list) or len(items) < 1:
-        raise RuntimeError("Embedding API returned unexpected shape")
-
-    vec = items[0].get("embedding")
-    if not isinstance(vec, list) or len(vec) != EMBEDDING_DIM:
-        raise RuntimeError(
-            f"Embedding dimension mismatch: expected {EMBEDDING_DIM}, got {len(vec) if isinstance(vec, list) else 0}"
-        )
-    return [float(x) for x in vec]
+    return vec
 
 
 # -----------------------------------------------------------------------------
