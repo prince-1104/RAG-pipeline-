@@ -5,6 +5,7 @@ import time
 from datetime import datetime
 
 from sqlmodel import select
+from sqlalchemy import update
 
 from app.db.models import GenerationJob, JobKind, JobStatus
 from app.db.session import get_session, init_db
@@ -26,20 +27,28 @@ def _claim_next_job() -> GenerationJob | None:
     In prod we can harden with SKIP LOCKED + multiple workers.
     """
     with get_session() as session:
-        job = session.exec(
-            select(GenerationJob)
+        now = datetime.utcnow()
+        # Atomic claim: update first queued row if still queued.
+        queued_id = (
+            select(GenerationJob.id)
             .where(GenerationJob.status == JobStatus.queued)
             .order_by(GenerationJob.created_at.asc())
             .limit(1)
-        ).first()
-        if not job:
-            return None
-        job.status = JobStatus.running
-        job.started_at = datetime.utcnow()
-        session.add(job)
+            .scalar_subquery()
+        )
+        stmt = (
+            update(GenerationJob)
+            .where(GenerationJob.id == queued_id)
+            .where(GenerationJob.status == JobStatus.queued)
+            .values(status=JobStatus.running, started_at=now)
+            .returning(GenerationJob.id)
+        )
+        row = session.exec(stmt).first()
         session.commit()
-        session.refresh(job)
-        return job
+        if not row:
+            return None
+        job_id = row[0] if isinstance(row, tuple) else row
+        return session.get(GenerationJob, job_id)
 
 
 def _finish_job_success(job_id: str, result: dict | None = None) -> None:
