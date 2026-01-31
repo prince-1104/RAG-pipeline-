@@ -7,6 +7,7 @@ from urllib.parse import urlparse
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 from typing import BinaryIO
+from starlette.concurrency import run_in_threadpool
 
 from app.settings import get_settings
 
@@ -278,7 +279,8 @@ class R2ObjectStore(ObjectStore):
         try:
             extra_args = {"ContentType": content_type or "application/pdf"}
             # upload_fileobj streams without loading into memory
-            self._s3_client.upload_fileobj(
+            await run_in_threadpool(
+                self._s3_client.upload_fileobj,
                 Fileobj=fileobj,
                 Bucket=self.bucket_name,
                 Key=key,
