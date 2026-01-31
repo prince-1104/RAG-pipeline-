@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import json
+import gc
 
 from sqlmodel import delete, select
+from sqlalchemy import func
 
 from app.db.models import Chunk, Corpus, Document
 from app.db.session import get_session
 from app.indexing.pdf_parse import extract_pages
-from app.indexing.qdrant_index import delete_document_points, upsert_chunks
+from app.indexing.qdrant_index import delete_document_points, upsert_document_chunks
 from app.indexing.syllabus_chunking import syllabus_aware_chunk
 from app.observability.logging import log
 from app.settings import get_settings
@@ -106,9 +108,9 @@ def _index_document_qdrant_core(document_meta: dict, pdf_bytes: bytes) -> int:
             session.add(chunk)
         session.commit()
 
-        persisted_chunks = session.exec(
-            select(Chunk).where(Chunk.document_id == document_id)
-        ).all()
+        chunk_count = session.exec(
+            select(func.count(Chunk.id)).where(Chunk.document_id == document_id)
+        ).one() or 0
         corpus = session.get(Corpus, corpus_id)
         doc_obj = session.get(Document, document_id)
 
@@ -118,11 +120,12 @@ def _index_document_qdrant_core(document_meta: dict, pdf_bytes: bytes) -> int:
             document_id=document_id,
             corpus_id=corpus_id,
         )
-        return len(persisted_chunks)
+        return int(chunk_count or 0)
 
     delete_document_points(document_id=document_id)
-    upsert_chunks(chunks=persisted_chunks, corpus=corpus, document=doc_obj)
-    return len(persisted_chunks)
+    upsert_document_chunks(document_id=document_id, corpus=corpus, document=doc_obj)
+    gc.collect()
+    return int(chunk_count or 0)
 
 
 def _load_pdf_bytes(store, uri: str) -> bytes:

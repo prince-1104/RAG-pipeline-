@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 from typing import Iterable
 
+from sqlmodel import select
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
     FieldCondition,
@@ -14,11 +15,12 @@ from qdrant_client.models import (
 )
 
 from app.db.models import Chunk, Corpus, Document
+from app.db.session import get_session
 from app.embeddings.factory import get_embedding_client
 from app.observability.logging import log
 from app.settings import get_settings
 
-EMBEDDING_BATCH_SIZE = 64
+DEFAULT_EMBEDDING_BATCH_SIZE = 24
 
 
 def embed_texts(texts: list[str]) -> list[list[float]]:
@@ -171,7 +173,8 @@ def upsert_chunks(
     settings = get_settings()
     client = get_qdrant_client()
     total = 0
-    for batch_chunks in _batch(chunks, EMBEDDING_BATCH_SIZE):
+    batch_size = max(1, int(getattr(settings, "embedding_batch_size", DEFAULT_EMBEDDING_BATCH_SIZE)))
+    for batch_chunks in _batch(chunks, batch_size):
         vectors = embed_texts([c.text for c in batch_chunks])
         points: list[PointStruct] = []
         for chunk, vector in zip(batch_chunks, vectors):
@@ -193,5 +196,50 @@ def upsert_chunks(
         document_id=document.id,
         corpus_id=document.corpus_id,
         chunks=len(chunks),
+    )
+    return total
+
+
+def upsert_document_chunks(
+    *, document_id: str, corpus: Corpus, document: Document
+) -> int:
+    settings = get_settings()
+    client = get_qdrant_client()
+    batch_size = max(1, int(getattr(settings, "embedding_batch_size", DEFAULT_EMBEDDING_BATCH_SIZE)))
+    total = 0
+    last_id: str | None = None
+
+    with get_session() as session:
+        while True:
+            q = select(Chunk).where(Chunk.document_id == document_id)
+            if last_id:
+                q = q.where(Chunk.id > last_id)
+            q = q.order_by(Chunk.id).limit(batch_size)
+            batch_chunks = session.exec(q).all()
+            if not batch_chunks:
+                break
+            last_id = batch_chunks[-1].id
+            vectors = embed_texts([c.text for c in batch_chunks])
+            points: list[PointStruct] = []
+            for chunk, vector in zip(batch_chunks, vectors):
+                points.append(
+                    PointStruct(
+                        id=str(chunk.id),
+                        vector=vector,
+                        payload=_chunk_payload(
+                            chunk=chunk,
+                            corpus=corpus,
+                            document=document,
+                        ),
+                    )
+                )
+            client.upsert(collection_name=settings.qdrant_collection, points=points)
+            total += len(points)
+
+    log.info(
+        "qdrant_upsert_complete",
+        document_id=document.id,
+        corpus_id=document.corpus_id,
+        chunks=total,
     )
     return total

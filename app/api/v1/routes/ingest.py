@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime
+import asyncio
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from sqlalchemy.exc import SQLAlchemyError
@@ -15,6 +16,19 @@ from app.settings import get_settings
 from app.storage.object_store import get_object_store
 
 router = APIRouter()
+
+_INGEST_SEMAPHORE: asyncio.Semaphore | None = None
+_INGEST_LIMIT: int | None = None
+
+
+def _get_ingest_semaphore() -> asyncio.Semaphore:
+    global _INGEST_SEMAPHORE, _INGEST_LIMIT
+    settings = get_settings()
+    limit = max(1, int(settings.ingest_max_concurrency))
+    if _INGEST_SEMAPHORE is None or _INGEST_LIMIT != limit:
+        _INGEST_SEMAPHORE = asyncio.Semaphore(limit)
+        _INGEST_LIMIT = limit
+    return _INGEST_SEMAPHORE
 
 
 def _get_or_create_niyukti_corpus(tenant_id: str, board: str = "CBSE") -> str:
@@ -125,27 +139,30 @@ async def ingest_pdf(
     index_job_id = None
 
     try:
-        with get_session() as session:
-            # Create job with RUNNING status (synchronous upload)
-            now = datetime.utcnow()
-            job = GenerationJob(
-                kind=JobKind.ingest,
-                status=JobStatus.running,  # Start as running since we're doing it synchronously
-                tenant_id=tenant_id,
-                corpus_id=None,  # Will be set after corpus creation
-                started_at=now,
-                request_json=json.dumps({
-                    "doc_id": doc_id,
-                    "board": board,
-                    "class_level": class_level,
-                    "subject": subject,
-                    "filename": file.filename,
-                }),
-            )
-            session.add(job)
-            session.commit()
-            session.refresh(job)
-            job_id = job.id
+        ingest_semaphore = _get_ingest_semaphore()
+        await ingest_semaphore.acquire()
+        try:
+            with get_session() as session:
+                # Create job with RUNNING status (synchronous upload)
+                now = datetime.utcnow()
+                job = GenerationJob(
+                    kind=JobKind.ingest,
+                    status=JobStatus.running,  # Start as running since we're doing it synchronously
+                    tenant_id=tenant_id,
+                    corpus_id=None,  # Will be set after corpus creation
+                    started_at=now,
+                    request_json=json.dumps({
+                        "doc_id": doc_id,
+                        "board": board,
+                        "class_level": class_level,
+                        "subject": subject,
+                        "filename": file.filename,
+                    }),
+                )
+                session.add(job)
+                session.commit()
+                session.refresh(job)
+                job_id = job.id
 
         # Upload to R2
         try:
@@ -304,6 +321,9 @@ async def ingest_pdf(
                         job.error_message = error_msg
                         session.commit()
             raise HTTPException(status_code=500, detail=error_msg) from e
+
+        finally:
+            ingest_semaphore.release()
 
     except SQLAlchemyError as e:
         log.error(

@@ -47,6 +47,7 @@ class Settings(BaseSettings):
     embedding_model: str = "text-embedding-ada-002"
     embedding_dim: int = 1536
     embedding_max_tokens: int = 512
+    embedding_batch_size: int = 24
     together_api_key: str | None = None
 
     llm_provider: str = "stub"
@@ -93,6 +94,9 @@ class Settings(BaseSettings):
 
     # Admin generation performance tuning (per-class parallelism)
     admin_generate_max_concurrency: int = 2
+
+    # Ingest performance tuning
+    ingest_max_concurrency: int = 2
 
     # Debug logging (file I/O can slow generation; keep off by default)
     debug_log_enabled: bool = False
