@@ -103,18 +103,18 @@ async def ingest_pdf(
             filename=file.filename,
         )
 
-    # Read file content
+    # Validate PDF header without loading the whole file into memory
     try:
-        content = await file.read()
+        header = await file.read(4)
+        await file.seek(0)
     except Exception as e:
         log.error("failed_to_read_uploaded_file", error=str(e), filename=file.filename)
         raise HTTPException(status_code=400, detail="failed_to_read_file") from e
 
-    if len(content) == 0:
+    if not header:
         raise HTTPException(status_code=400, detail="file_is_empty")
 
-    # Validate PDF header
-    if not content.startswith(b"%PDF"):
+    if not header.startswith(b"%PDF"):
         raise HTTPException(status_code=400, detail="file_is_not_a_valid_pdf")
 
     # Create ingestion job to track status
@@ -150,12 +150,13 @@ async def ingest_pdf(
         # Upload to R2
         try:
             store = get_object_store()
-            storage_uri = await store.put_pdf_with_key(
+            storage_uri = await store.put_pdf_with_key_stream(
                 board=board,
                 class_level=class_level,
                 subject=subject,
                 doc_id=doc_id,
-                content=content,
+                fileobj=file.file,
+                content_type=file.content_type,
             )
 
             # Get or create corpus for this tenant

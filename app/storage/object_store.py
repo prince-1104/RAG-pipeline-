@@ -6,6 +6,7 @@ from urllib.parse import urlparse
 
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
+from typing import BinaryIO
 
 from app.settings import get_settings
 
@@ -18,6 +19,20 @@ class ObjectStore:
         """
         Upload PDF to R2 with specific key structure: board=<board>/class=<class>/subject=<subject>/pdfs/<doc_id>.pdf
         Returns R2 URI (r2://bucket/key).
+        """
+        raise NotImplementedError
+
+    async def put_pdf_with_key_stream(
+        self,
+        board: str,
+        class_level: int,
+        subject: str,
+        doc_id: str,
+        fileobj: BinaryIO,
+        content_type: str | None = None,
+    ) -> str:
+        """
+        Stream upload PDF to object store with the standard key structure.
         """
         raise NotImplementedError
 
@@ -59,6 +74,18 @@ class LocalObjectStore(ObjectStore):
     async def put_pdf_with_key(self, board: str, class_level: int, subject: str, doc_id: str, content: bytes) -> str:
         """Not supported for local storage - use R2 backend."""
         raise NotImplementedError("put_pdf_with_key not supported for local storage backend")
+
+    async def put_pdf_with_key_stream(
+        self,
+        board: str,
+        class_level: int,
+        subject: str,
+        doc_id: str,
+        fileobj: BinaryIO,
+        content_type: str | None = None,
+    ) -> str:
+        """Not supported for local storage - use R2 backend."""
+        raise NotImplementedError("put_pdf_with_key_stream not supported for local storage backend")
 
     async def put_pdf(self, tenant_id: str, corpus_id: str, filename: str, content: bytes) -> str:
         """
@@ -212,6 +239,75 @@ class R2ObjectStore(ObjectStore):
         except BotoCoreError as e:
             log.error(
                 "r2_upload_boto_error",
+                bucket=self.bucket_name,
+                key=key,
+                error=str(e),
+                error_type=type(e).__name__,
+                doc_id=doc_id,
+            )
+            raise RuntimeError(f"r2_client_error: {e}") from e
+
+    async def put_pdf_with_key_stream(
+        self,
+        board: str,
+        class_level: int,
+        subject: str,
+        doc_id: str,
+        fileobj: BinaryIO,
+        content_type: str | None = None,
+    ) -> str:
+        """
+        Stream upload PDF to R2 with key structure: board=<board>/class=<class>/subject=<subject>/pdfs/<doc_id>.pdf
+        Returns R2 URI: r2://<bucket>/board=<board>/class=<class>/subject=<subject>/pdfs/<doc_id>.pdf
+        """
+        from app.observability.logging import log
+
+        # Build key with required structure
+        safe_board = board.replace("/", "_").replace("\\", "_")
+        safe_subject = subject.replace("/", "_").replace("\\", "_")
+        safe_doc_id = doc_id.replace("/", "_").replace("\\", "_").replace(".", "_")
+        key = f"board={safe_board}/class={class_level}/subject={safe_subject}/pdfs/{safe_doc_id}.pdf"
+
+        log.info(
+            "r2_stream_upload_starting",
+            bucket=self.bucket_name,
+            key=key,
+            doc_id=doc_id,
+        )
+
+        try:
+            extra_args = {"ContentType": content_type or "application/pdf"}
+            # upload_fileobj streams without loading into memory
+            self._s3_client.upload_fileobj(
+                Fileobj=fileobj,
+                Bucket=self.bucket_name,
+                Key=key,
+                ExtraArgs=extra_args,
+            )
+            storage_uri = f"r2://{self.bucket_name}/{key}"
+            log.info(
+                "r2_stream_upload_success",
+                bucket=self.bucket_name,
+                key=key,
+                storage_uri=storage_uri,
+                doc_id=doc_id,
+            )
+            return storage_uri
+        except ClientError as e:
+            error_code = e.response.get("Error", {}).get("Code", "Unknown")
+            error_msg = e.response.get("Error", {}).get("Message", str(e))
+            log.error(
+                "r2_stream_upload_client_error",
+                bucket=self.bucket_name,
+                key=key,
+                error_code=error_code,
+                error_message=error_msg,
+                doc_id=doc_id,
+            )
+            raise RuntimeError(f"r2_upload_failed: {error_code} - {error_msg}") from e
+        except BotoCoreError as e:
+            log.error(
+                "r2_stream_upload_boto_error",
                 bucket=self.bucket_name,
                 key=key,
                 error=str(e),
