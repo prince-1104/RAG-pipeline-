@@ -98,6 +98,9 @@ class Settings(BaseSettings):
     # Ingest performance tuning
     ingest_max_concurrency: int = 2
 
+    # Job recovery
+    job_stale_timeout_s: int = 1800
+
     # Debug logging (file I/O can slow generation; keep off by default)
     debug_log_enabled: bool = False
 

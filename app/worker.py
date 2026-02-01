@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from sqlmodel import select
 from sqlalchemy import update
@@ -28,6 +28,17 @@ def _claim_next_job() -> GenerationJob | None:
     """
     with get_session() as session:
         now = datetime.utcnow()
+        settings = get_settings()
+        stale_cutoff = now - timedelta(seconds=int(settings.job_stale_timeout_s))
+        # Requeue stale running jobs so they can be retried after crashes.
+        session.exec(
+            update(GenerationJob)
+            .where(GenerationJob.status == JobStatus.running)
+            .where(GenerationJob.started_at.is_not(None))
+            .where(GenerationJob.started_at < stale_cutoff)
+            .values(status=JobStatus.queued, started_at=None)
+        )
+        session.commit()
         # Atomic claim: update first queued row if still queued.
         queued_id = (
             select(GenerationJob.id)
