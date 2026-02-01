@@ -56,6 +56,7 @@ async def ingest_pdf_niyukti(
     board: str = Form(..., description="Board identifier (e.g., 'CBSE')"),
     class_level: int = Form(..., ge=1, le=12, description="Class level (1-12)"),
     subject: str = Form(..., description="Subject name"),
+    chapter: str | None = Form(None, description="Chapter name (optional)"),
 ):
     """
     PDF ingestion endpoint for Niyukti platform compatibility.
@@ -79,13 +80,14 @@ async def ingest_pdf_niyukti(
         board=board,
         class_level=class_level,
         subject=subject,
+        chapter=chapter,
         tenant_id=tenant_id,
         filename=file.filename if file else None,
         path=str(request.url.path),
     )
     
     # Delegate to the main ingest implementation with tenant_id
-    return await ingest_pdf(file, doc_id, board, class_level, subject, tenant_id)
+    return await ingest_pdf(file, doc_id, board, class_level, subject, chapter, tenant_id)
 
 
 @router.post("/ingest/pdf", response_model=PDFIngestResponse)
@@ -96,12 +98,13 @@ async def ingest_pdf_niyukti_pdf(
     board: str = Form(..., description="Board identifier (e.g., 'CBSE')"),
     class_level: int = Form(..., ge=1, le=12, description="Class level (1-12)"),
     subject: str = Form(..., description="Subject name"),
+    chapter: str | None = Form(None, description="Chapter name (optional)"),
 ):
     """
     Compatibility alias for Niyukti: POST /api/v1/ingest/pdf.
     """
     tenant_id = request.headers.get("X-Tenant-ID", "niyukti-platform")
-    return await ingest_pdf(file, doc_id, board, class_level, subject, tenant_id)
+    return await ingest_pdf(file, doc_id, board, class_level, subject, chapter, tenant_id)
 
 
 @router.get("/ingest/stats")

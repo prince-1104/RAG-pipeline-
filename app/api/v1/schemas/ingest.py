@@ -9,6 +9,7 @@ class PDFIngestRequest(BaseModel):
     board: str = Field(..., description="Board identifier (e.g., 'CBSE')")
     class_level: int = Field(..., ge=1, le=12, description="Class level (1-12)")
     subject: str = Field(..., description="Subject name")
+    chapter: str | None = Field(None, description="Optional chapter name")
 
 
 class PDFIngestResponse(BaseModel):

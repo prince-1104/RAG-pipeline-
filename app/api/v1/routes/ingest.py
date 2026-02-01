@@ -66,6 +66,7 @@ async def ingest_pdf(
     board: str = Form(..., description="Board identifier (e.g., 'CBSE')"),
     class_level: int = Form(..., ge=1, le=12, description="Class level (1-12)"),
     subject: str = Form(..., description="Subject name"),
+    chapter: str | None = Form(None, description="Chapter name (optional)"),
     tenant_id: str = Form(None, description="Tenant ID (defaults to 'niyukti-platform')"),
 ):
     """
@@ -93,6 +94,7 @@ async def ingest_pdf(
         board=board,
         class_level=class_level,
         subject=subject,
+        chapter=chapter,
         tenant_id=tenant_id,
         filename=file.filename if file else None,
     )
@@ -156,6 +158,7 @@ async def ingest_pdf(
                         "board": board,
                         "class_level": class_level,
                         "subject": subject,
+                        "chapter": chapter,
                         "filename": file.filename,
                     }),
                 )
@@ -190,6 +193,7 @@ async def ingest_pdf(
                     storage_uri=storage_uri,
                     class_level=class_level,
                     subject=subject,
+                    chapter=chapter,
                     toc_json=None,  # TOC can be added later if available
                 )
                 session.add(document)
