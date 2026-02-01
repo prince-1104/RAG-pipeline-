@@ -47,7 +47,9 @@ class Settings(BaseSettings):
     embedding_model: str = "text-embedding-ada-002"
     embedding_dim: int = 1536
     embedding_max_tokens: int = 512
-    embedding_batch_size: int = 24
+    embedding_batch_size: int = 2
+    embedding_chunk_max_chars: int = 1500
+    embedding_chunk_overlap_chars: int = 200
     together_api_key: str | None = None
 
     llm_provider: str = "stub"

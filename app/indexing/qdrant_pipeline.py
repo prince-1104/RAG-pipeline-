@@ -11,7 +11,7 @@ from app.db.session import get_session
 from app.indexing.pdf_parse import extract_pages, extract_pages_from_path
 from app.indexing.qdrant_index import delete_document_points, upsert_document_chunks
 from app.indexing.syllabus_chunking import syllabus_aware_chunk
-from app.observability.logging import log
+from app.observability.logging import get_process_rss_mb, log
 from app.settings import get_settings
 from app.storage.object_store import get_object_store
 
@@ -84,10 +84,23 @@ def _index_document_qdrant_core(document_meta: dict, pages: list) -> int:
         class_level=int(class_level),
         subject=str(subject).strip(),
         toc=toc,
+        max_chars=max(200, int(settings.embedding_chunk_max_chars)),
+        overlap_chars=max(0, int(settings.embedding_chunk_overlap_chars)),
         max_tokens=settings.embedding_max_tokens,
     )
     if not produced:
         return 0
+
+    rss_mb = get_process_rss_mb()
+    if rss_mb is not None:
+        log.info(
+            "index_memory",
+            stage="post_chunking",
+            document_id=document_id,
+            corpus_id=corpus_id,
+            chunks=len(produced),
+            rss_mb=round(rss_mb, 2),
+        )
 
     override_chapter = document_meta.get("chapter")
     if override_chapter and str(override_chapter).strip():
@@ -133,4 +146,14 @@ def _index_document_qdrant_core(document_meta: dict, pages: list) -> int:
     delete_document_points(document_id=document_id)
     upsert_document_chunks(document_id=document_id, corpus=corpus, document=doc_obj)
     gc.collect()
+
+    rss_mb = get_process_rss_mb()
+    if rss_mb is not None:
+        log.info(
+            "index_memory",
+            stage="post_embedding",
+            document_id=document_id,
+            corpus_id=corpus_id,
+            rss_mb=round(rss_mb, 2),
+        )
     return int(chunk_count or 0)

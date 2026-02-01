@@ -11,7 +11,7 @@ from app.db.models import GenerationJob, JobKind, JobStatus
 from app.db.session import get_session, init_db
 from app.indexing.index_job import run_index_job
 from app.indexing.qdrant_index import ensure_qdrant_payload_indexes
-from app.observability.logging import configure_logging, log
+from app.observability.logging import configure_logging, get_process_rss_mb, log
 from app.settings import get_settings
 from app.tasks.admin_generate_job import run_admin_generate_job
 from app.tasks.generate_job import run_generate_job
@@ -99,7 +99,15 @@ def run_forever() -> None:
             time.sleep(POLL_INTERVAL_S)
             continue
 
-        log.info("job_claimed", job_id=job.id, kind=job.kind.value, tenant_id=job.tenant_id, corpus_id=job.corpus_id)
+        rss_mb = get_process_rss_mb()
+        log.info(
+            "job_claimed",
+            job_id=job.id,
+            kind=job.kind.value,
+            tenant_id=job.tenant_id,
+            corpus_id=job.corpus_id,
+            rss_mb=round(rss_mb, 2) if rss_mb is not None else None,
+        )
         try:
             if job.kind == JobKind.index:
                 run_index_job(job)

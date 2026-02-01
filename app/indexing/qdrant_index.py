@@ -20,8 +20,8 @@ from app.embeddings.factory import get_embedding_client
 from app.observability.logging import log
 from app.settings import get_settings
 
-DEFAULT_EMBEDDING_BATCH_SIZE = 24
-EMBEDDING_MAX_CHARS = 8000
+DEFAULT_EMBEDDING_BATCH_SIZE = 2
+EMBEDDING_MAX_CHARS = 2000
 
 
 def _normalize_text(text: str) -> str:
@@ -46,17 +46,13 @@ def _embed_with_split(
     except RuntimeError as exc:
         msg = str(exc)
         if " 400" in msg or "400:" in msg or "status=400" in msg:
-            if len(items) == 1:
-                log.warning(
-                    "embedding_item_skipped",
-                    provider=provider,
-                    error=msg[:200],
-                )
-                return []
-            mid = max(1, len(items) // 2)
-            left = _embed_with_split(items[:mid], client=client, provider=provider)
-            right = _embed_with_split(items[mid:], client=client, provider=provider)
-            return left + right
+            log.error(
+                "embedding_bad_request",
+                provider=provider,
+                batch_size=len(items),
+                error=msg[:200],
+            )
+            raise RuntimeError("embedding_bad_request") from exc
         raise
 
 
@@ -66,8 +62,6 @@ def embed_texts(texts: list[str]) -> list[tuple[int, list[float]]]:
     settings = get_settings()
     provider = settings.embedding_provider
     client = get_embedding_client()
-    max_attempts = 3
-    delay_s = 0.5
 
     items: list[tuple[int, str]] = []
     for idx, txt in enumerate(texts):
@@ -79,32 +73,26 @@ def embed_texts(texts: list[str]) -> list[tuple[int, list[float]]]:
     if not items:
         return []
 
-    for attempt in range(1, max_attempts + 1):
-        start = time.perf_counter()
-        try:
-            results = _embed_with_split(items, client=client, provider=provider)
-            duration_ms = int((time.perf_counter() - start) * 1000)
-            log.info(
-                "embedding_batch_complete",
-                provider=provider,
-                batch_size=len(items),
-                embedded=len(results),
-                duration_ms=duration_ms,
-            )
-            return results
-        except Exception as exc:  # noqa: BLE001
-            log.warning(
-                "embedding_batch_failed",
-                provider=provider,
-                batch_size=len(items),
-                attempt=attempt,
-                error=str(exc),
-            )
-            if attempt == max_attempts:
-                raise
-            time.sleep(delay_s)
-            delay_s *= 2
-    return []
+    start = time.perf_counter()
+    try:
+        results = _embed_with_split(items, client=client, provider=provider)
+        duration_ms = int((time.perf_counter() - start) * 1000)
+        log.info(
+            "embedding_batch_complete",
+            provider=provider,
+            batch_size=len(items),
+            embedded=len(results),
+            duration_ms=duration_ms,
+        )
+        return results
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "embedding_batch_failed",
+            provider=provider,
+            batch_size=len(items),
+            error=str(exc),
+        )
+        raise
 
 
 def get_qdrant_client() -> QdrantClient:
