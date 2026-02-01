@@ -86,11 +86,31 @@ def embed_query(query: str) -> list[float]:
 # -----------------------------------------------------------------------------
 
 
-def _qdrant_search(client: QdrantClient, *, collection: str, vector: list[float], flt: Filter, limit: int):
+def _qdrant_search(
+    client: QdrantClient, *, collection: str, vector: list[float], flt: Filter, limit: int
+) -> list[Any]:
     """
     Compatibility wrapper for qdrant-client API differences.
     Returns list of scored points.
     """
+    if hasattr(client, "query_points"):
+        try:
+            resp = client.query_points(
+                collection_name=collection,
+                query=vector,
+                filter=flt,
+                limit=limit,
+                with_payload=True,
+            )
+        except TypeError:
+            resp = client.query_points(
+                collection_name=collection,
+                query_vector=vector,
+                query_filter=flt,
+                limit=limit,
+                with_payload=True,
+            )
+        return resp.points if hasattr(resp, "points") else resp
     if hasattr(client, "search_points"):
         resp = client.search_points(
             collection_name=collection,
