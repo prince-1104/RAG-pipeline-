@@ -86,6 +86,27 @@ def embed_query(query: str) -> list[float]:
 # -----------------------------------------------------------------------------
 
 
+def _qdrant_search(client: QdrantClient, *, collection: str, vector: list[float], flt: Filter, limit: int):
+    """
+    Compatibility wrapper for qdrant-client API differences.
+    Returns list of scored points.
+    """
+    if hasattr(client, "search_points"):
+        resp = client.search_points(
+            collection_name=collection,
+            query_vector=vector,
+            query_filter=flt,
+            limit=limit,
+        )
+        return resp.points if hasattr(resp, "points") else resp
+    return client.search(
+        collection_name=collection,
+        query_vector=vector,
+        query_filter=flt,
+        limit=limit,
+    )
+
+
 def retrieve_chunks(
     *,
     board: str,
@@ -122,10 +143,11 @@ def retrieve_chunks(
         ]
     )
 
-    hits = client.search(
-        collection_name=settings.qdrant_collection,
-        query_vector=vector,
-        query_filter=filter_clause,
+    hits = _qdrant_search(
+        client,
+        collection=settings.qdrant_collection,
+        vector=vector,
+        flt=filter_clause,
         limit=k,
     )
 
@@ -138,10 +160,11 @@ def retrieve_chunks(
                 FieldCondition(key="subject", match=MatchValue(value=subject)),
             ]
         )
-        hits = client.search(
-            collection_name=settings.qdrant_collection,
-            query_vector=vector,
-            query_filter=fallback_filter,
+        hits = _qdrant_search(
+            client,
+            collection=settings.qdrant_collection,
+            vector=vector,
+            flt=fallback_filter,
             limit=k,
         )
 
