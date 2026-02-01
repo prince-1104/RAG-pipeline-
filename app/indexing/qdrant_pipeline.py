@@ -8,7 +8,7 @@ from sqlalchemy import func
 
 from app.db.models import Chunk, Corpus, Document
 from app.db.session import get_session
-from app.indexing.pdf_parse import extract_pages
+from app.indexing.pdf_parse import extract_pages, extract_pages_from_path
 from app.indexing.qdrant_index import delete_document_points, upsert_document_chunks
 from app.indexing.syllabus_chunking import syllabus_aware_chunk
 from app.observability.logging import log
@@ -26,8 +26,9 @@ def index_document_qdrant(*, document_id: str) -> int:
         return 0
 
     store = get_object_store()
-    pdf_bytes = _load_pdf_bytes(store, document_meta["storage_uri"])
-    return _index_document_qdrant_core(document_meta, pdf_bytes)
+    with store.open_local_pdf_path(document_meta["storage_uri"]) as pdf_path:
+        pages = extract_pages_from_path(pdf_path)
+    return _index_document_qdrant_core(document_meta, pages)
 
 
 async def index_document_qdrant_async(*, document_id: str) -> int:
@@ -40,7 +41,8 @@ async def index_document_qdrant_async(*, document_id: str) -> int:
 
     store = get_object_store()
     pdf_bytes = await store.get_bytes(document_meta["storage_uri"])
-    return _index_document_qdrant_core(document_meta, pdf_bytes)
+    pages = extract_pages(pdf_bytes)
+    return _index_document_qdrant_core(document_meta, pages)
 
 
 def _load_document_meta(document_id: str) -> dict | None:
@@ -60,8 +62,7 @@ def _load_document_meta(document_id: str) -> dict | None:
         }
 
 
-def _index_document_qdrant_core(document_meta: dict, pdf_bytes: bytes) -> int:
-    pages = extract_pages(pdf_bytes)
+def _index_document_qdrant_core(document_meta: dict, pages: list) -> int:
     toc = json.loads(document_meta["toc_json"]) if document_meta["toc_json"] else None
     document_id = document_meta["document_id"]
     corpus_id = document_meta["corpus_id"]
@@ -126,13 +127,3 @@ def _index_document_qdrant_core(document_meta: dict, pdf_bytes: bytes) -> int:
     upsert_document_chunks(document_id=document_id, corpus=corpus, document=doc_obj)
     gc.collect()
     return int(chunk_count or 0)
-
-
-def _load_pdf_bytes(store, uri: str) -> bytes:
-    import asyncio
-
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        return asyncio.run(store.get_bytes(uri))
-    raise RuntimeError("asyncio.run() cannot be called from a running event loop")

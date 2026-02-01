@@ -3,10 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
+from contextlib import contextmanager
+from typing import BinaryIO, Iterator
+import os
+import tempfile
 
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
-from typing import BinaryIO
 from starlette.concurrency import run_in_threadpool
 
 from app.settings import get_settings
@@ -38,6 +41,14 @@ class ObjectStore:
         raise NotImplementedError
 
     async def get_bytes(self, uri: str) -> bytes:
+        raise NotImplementedError
+
+    @contextmanager
+    def open_local_pdf_path(self, uri: str) -> Iterator[Path]:
+        """
+        Return a local filesystem path for the PDF. For remote storage,
+        this should download to a temp file and clean it up on exit.
+        """
         raise NotImplementedError
 
     def build_local_pdf_uri(self, class_level: int, subject: str, filename: str) -> str:
@@ -156,6 +167,43 @@ class LocalObjectStore(ObjectStore):
             if not (_is_within(pdf_base, target) or _is_within(upl_base, target)):
                 raise ValueError("file_uri_outside_allowed_dirs")
             return _read_pdf_bytes(target)
+
+        raise ValueError("unsupported_uri_scheme")
+
+    @contextmanager
+    def open_local_pdf_path(self, uri: str) -> Iterator[Path]:
+        parsed = urlparse(uri)
+        scheme = parsed.scheme
+        if scheme == "localpdf":
+            base = self._resolve_base_path(self.pdf_base_path)
+            rel = (parsed.netloc + parsed.path).lstrip("/")
+            target = (base / rel).resolve()
+            if not _is_within(base, target):
+                raise ValueError("pdf_outside_base_path")
+            if not target.exists():
+                raise FileNotFoundError(f"pdf_missing:{rel}")
+            yield target
+            return
+
+        if scheme == "localupload":
+            base = self._resolve_base_path(self.uploads_base_path)
+            rel = (parsed.netloc + parsed.path).lstrip("/")
+            target = (base / rel).resolve()
+            if not _is_within(base, target):
+                raise ValueError("upload_outside_base_path")
+            if not target.exists():
+                raise FileNotFoundError(f"pdf_missing:{rel}")
+            yield target
+            return
+
+        if scheme == "file":
+            target = Path(parsed.path).resolve()
+            pdf_base = self._resolve_base_path(self.pdf_base_path)
+            upl_base = self._resolve_base_path(self.uploads_base_path)
+            if not (_is_within(pdf_base, target) or _is_within(upl_base, target)):
+                raise ValueError("file_uri_outside_allowed_dirs")
+            yield target
+            return
 
         raise ValueError("unsupported_uri_scheme")
 
@@ -337,6 +385,37 @@ class R2ObjectStore(ObjectStore):
             raise RuntimeError(f"r2_get_failed: {e}") from e
         except BotoCoreError as e:
             raise RuntimeError(f"r2_client_error: {e}") from e
+
+    @contextmanager
+    def open_local_pdf_path(self, uri: str) -> Iterator[Path]:
+        parsed = urlparse(uri)
+        if parsed.scheme != "r2":
+            raise ValueError(f"unsupported_uri_scheme_for_r2: {parsed.scheme}")
+
+        bucket = parsed.netloc
+        key = parsed.path.lstrip("/")
+        tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+        try:
+            self._s3_client.download_fileobj(
+                Bucket=bucket,
+                Key=key,
+                Fileobj=tmp_file,
+            )
+            tmp_file.flush()
+            tmp_file.close()
+            yield Path(tmp_file.name)
+        except ClientError as e:
+            error_code = e.response.get("Error", {}).get("Code", "Unknown")
+            if error_code == "NoSuchKey":
+                raise FileNotFoundError(f"r2_key_not_found: {key}") from e
+            raise RuntimeError(f"r2_get_failed: {e}") from e
+        except BotoCoreError as e:
+            raise RuntimeError(f"r2_client_error: {e}") from e
+        finally:
+            try:
+                os.unlink(tmp_file.name)
+            except Exception:
+                pass
 
     def build_local_pdf_uri(self, class_level: int, subject: str, filename: str) -> str:
         """Not supported for R2."""
