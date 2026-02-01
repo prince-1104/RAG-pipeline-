@@ -83,8 +83,10 @@ def ensure_qdrant_payload_indexes() -> None:
         "syllabus": PayloadSchemaType.KEYWORD,
         "syllabus_version": PayloadSchemaType.KEYWORD,
         "class_level": PayloadSchemaType.INTEGER,
+        "class": PayloadSchemaType.KEYWORD,
         "subject": PayloadSchemaType.KEYWORD,
         "chapter": PayloadSchemaType.KEYWORD,
+        "chapter_number": PayloadSchemaType.INTEGER,
     }
 
     collection = client.get_collection(collection_name=settings.qdrant_collection)
@@ -140,9 +142,23 @@ def delete_document_points(*, document_id: str) -> None:
     )
 
 
+def _extract_chapter_number(chapter: str | None) -> int | None:
+    if not chapter:
+        return None
+    text = str(chapter)
+    for token in text.replace(":", " ").replace(".", " ").split():
+        if token.isdigit():
+            try:
+                return int(token)
+            except ValueError:
+                return None
+    return None
+
+
 def _chunk_payload(
     *, chunk: Chunk, corpus: Corpus, document: Document
 ) -> dict[str, object]:
+    chapter_number = _extract_chapter_number(chunk.chapter)
     return {
         "chunk_id": chunk.id,
         "document_id": chunk.document_id,
@@ -152,8 +168,10 @@ def _chunk_payload(
         "syllabus": document.syllabus,
         "syllabus_version": document.syllabus_version,
         "class_level": chunk.class_level,
+        "class": str(chunk.class_level),
         "subject": chunk.subject,
         "chapter": chunk.chapter,
+        "chapter_number": chapter_number,
         "page_start": chunk.page_start,
         "page_end": chunk.page_end,
         "text": chunk.text,

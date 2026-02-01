@@ -71,3 +71,16 @@ class AdminBatchGenerateQuestionsResponse(BaseModel):
     jobs_created: int
     documents: list[DocumentJobStatus]
     message: str = "Batch question generation jobs have been queued"
+
+
+class AdminReindexRequest(BaseModel):
+    """Request to re-index existing documents."""
+    document_ids: list[str] = Field(..., min_length=1, description="List of document IDs to re-index")
+
+
+class AdminReindexResponse(BaseModel):
+    """Response for admin re-index request."""
+    job_id: str
+    status: str = "queued"
+    documents: int
+    message: str = "Re-index job has been queued"

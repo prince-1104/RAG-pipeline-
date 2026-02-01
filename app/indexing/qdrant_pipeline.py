@@ -59,6 +59,7 @@ def _load_document_meta(document_id: str) -> dict | None:
             "toc_json": document.toc_json,
             "class_level": document.class_level,
             "subject": document.subject,
+            "chapter": document.chapter,
         }
 
 
@@ -87,6 +88,12 @@ def _index_document_qdrant_core(document_meta: dict, pages: list) -> int:
     )
     if not produced:
         return 0
+
+    override_chapter = document_meta.get("chapter")
+    if override_chapter and str(override_chapter).strip():
+        ch_name = str(override_chapter).strip()
+        for ch in produced:
+            ch.chapter = ch_name
 
     with get_session() as session:
         # Idempotency: remove existing chunks for this document

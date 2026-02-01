@@ -10,6 +10,8 @@ from app.api.v1.schemas.admin import (
     AdminBatchGenerateQuestionsResponse,
     AdminGenerateQuestionsRequest,
     AdminGenerateQuestionsResponse,
+    AdminReindexRequest,
+    AdminReindexResponse,
     DocumentJobStatus,
 )
 from app.db.models import Corpus, Document, GenerationJob, JobKind, JobStatus
@@ -307,3 +309,54 @@ def admin_batch_generate_questions(request: Request, req: AdminBatchGenerateQues
         documents=document_statuses,
         message=f"Batch processing complete. {jobs_created} job(s) created for {len([d for d in document_statuses if d.status == 'queued'])} document(s)."
     )
+
+
+@router.post("/reindex", response_model=AdminReindexResponse)
+def admin_reindex_documents(request: Request, req: AdminReindexRequest):
+    """
+    Admin endpoint to re-index existing documents.
+    Creates a single index job for the provided document IDs.
+    """
+    tenant_id = request.headers.get("X-Tenant-ID", "niyukti-platform")
+
+    with get_session() as session:
+        docs = session.exec(select(Document).where(Document.id.in_(req.document_ids))).all()
+        if not docs or len(docs) != len(req.document_ids):
+            raise HTTPException(status_code=404, detail="some_documents_not_found")
+
+        corpus_ids = {doc.corpus_id for doc in docs}
+        if len(corpus_ids) != 1:
+            raise HTTPException(status_code=400, detail="documents_multiple_corpus_not_supported")
+        corpus_id = next(iter(corpus_ids))
+
+        corpus = session.get(Corpus, corpus_id)
+        if not corpus:
+            raise HTTPException(status_code=404, detail="corpus_not_found")
+        if corpus.tenant_id != tenant_id:
+            raise HTTPException(status_code=403, detail="tenant_mismatch")
+
+        job = GenerationJob(
+            kind=JobKind.index,
+            status=JobStatus.queued,
+            tenant_id=tenant_id,
+            corpus_id=corpus_id,
+            request_json=json.dumps({"document_ids": req.document_ids}),
+        )
+        session.add(job)
+        session.commit()
+        session.refresh(job)
+
+        log.info(
+            "admin_reindex_job_created",
+            job_id=job.id,
+            corpus_id=corpus_id,
+            documents=len(req.document_ids),
+            tenant_id=tenant_id,
+        )
+
+        return AdminReindexResponse(
+            job_id=job.id,
+            status="queued",
+            documents=len(req.document_ids),
+            message=f"Re-index job queued for {len(req.document_ids)} document(s).",
+        )

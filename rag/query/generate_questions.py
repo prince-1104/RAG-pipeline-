@@ -112,12 +112,11 @@ def retrieve_chunks(
         timeout=settings.qdrant_timeout_s,
     )
 
-    # Payload: board, class (str), subject, chapter_number (int or str). Must match indexing.
-    class_str = str(class_val)
+    # Payload: board, class_level (int), subject, chapter_number (int).
     filter_clause = Filter(
         must=[
             FieldCondition(key="board", match=MatchValue(value=board)),
-            FieldCondition(key="class", match=MatchValue(value=class_str)),
+            FieldCondition(key="class_level", match=MatchValue(value=class_val)),
             FieldCondition(key="subject", match=MatchValue(value=subject)),
             FieldCondition(key="chapter_number", match=MatchValue(value=chapter_number)),
         ]
@@ -129,6 +128,22 @@ def retrieve_chunks(
         query_filter=filter_clause,
         limit=k,
     )
+
+    if not hits:
+        # Fallback: relax chapter filter to avoid empty results when chapter parsing is missing.
+        fallback_filter = Filter(
+            must=[
+                FieldCondition(key="board", match=MatchValue(value=board)),
+                FieldCondition(key="class_level", match=MatchValue(value=class_val)),
+                FieldCondition(key="subject", match=MatchValue(value=subject)),
+            ]
+        )
+        hits = client.search(
+            collection_name=settings.qdrant_collection,
+            query_vector=vector,
+            query_filter=fallback_filter,
+            limit=k,
+        )
 
     texts: list[str] = []
     for h in hits:
@@ -228,10 +243,7 @@ def generate_questions(
             subject=subject,
             chapter_number=chapter_number,
         )
-        raise RuntimeError(
-            "No relevant chunks found for the given board, class, subject, and chapter. "
-            "Check filters or indexing."
-        )
+        return []
 
     system, user = build_prompt(
         chunks, difficulty=difficulty, question_type=question_type, count=count
