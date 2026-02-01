@@ -143,29 +143,28 @@ async def ingest_pdf(
     try:
         ingest_semaphore = _get_ingest_semaphore()
         await ingest_semaphore.acquire()
-        try:
-            with get_session() as session:
-                # Create job with RUNNING status (synchronous upload)
-                now = datetime.utcnow()
-                job = GenerationJob(
-                    kind=JobKind.ingest,
-                    status=JobStatus.running,  # Start as running since we're doing it synchronously
-                    tenant_id=tenant_id,
-                    corpus_id=None,  # Will be set after corpus creation
-                    started_at=now,
-                    request_json=json.dumps({
-                        "doc_id": doc_id,
-                        "board": board,
-                        "class_level": class_level,
-                        "subject": subject,
-                        "chapter": chapter,
-                        "filename": file.filename,
-                    }),
-                )
-                session.add(job)
-                session.commit()
-                session.refresh(job)
-                job_id = job.id
+        with get_session() as session:
+            # Create job with RUNNING status (synchronous upload)
+            now = datetime.utcnow()
+            job = GenerationJob(
+                kind=JobKind.ingest,
+                status=JobStatus.running,  # Start as running since we're doing it synchronously
+                tenant_id=tenant_id,
+                corpus_id=None,  # Will be set after corpus creation
+                started_at=now,
+                request_json=json.dumps({
+                    "doc_id": doc_id,
+                    "board": board,
+                    "class_level": class_level,
+                    "subject": subject,
+                    "chapter": chapter,
+                    "filename": file.filename,
+                }),
+            )
+            session.add(job)
+            session.commit()
+            session.refresh(job)
+            job_id = job.id
 
         # Upload to R2
         try:

@@ -21,9 +21,46 @@ from app.observability.logging import log
 from app.settings import get_settings
 
 DEFAULT_EMBEDDING_BATCH_SIZE = 24
+EMBEDDING_MAX_CHARS = 8000
 
 
-def embed_texts(texts: list[str]) -> list[list[float]]:
+def _normalize_text(text: str) -> str:
+    cleaned = text.encode("utf-8", "ignore").decode("utf-8").strip()
+    if len(cleaned) > EMBEDDING_MAX_CHARS:
+        cleaned = cleaned[:EMBEDDING_MAX_CHARS]
+    return cleaned
+
+
+def _embed_with_split(
+    items: list[tuple[int, str]],
+    *,
+    client,
+    provider: str,
+) -> list[tuple[int, list[float]]]:
+    if not items:
+        return []
+    texts = [t for _, t in items]
+    try:
+        vectors = client.embed(texts)
+        return [(items[i][0], vec) for i, vec in enumerate(vectors)]
+    except RuntimeError as exc:
+        msg = str(exc)
+        if " 400" in msg or "400:" in msg or "status=400" in msg:
+            if len(items) == 1:
+                log.warning(
+                    "embedding_item_skipped",
+                    provider=provider,
+                    error=msg[:200],
+                )
+                return []
+            mid = max(1, len(items) // 2)
+            left = _embed_with_split(items[:mid], client=client, provider=provider)
+            right = _embed_with_split(items[mid:], client=client, provider=provider)
+            return left + right
+        raise
+
+
+def embed_texts(texts: list[str]) -> list[tuple[int, list[float]]]:
     if not texts:
         return []
     settings = get_settings()
@@ -32,23 +69,34 @@ def embed_texts(texts: list[str]) -> list[list[float]]:
     max_attempts = 3
     delay_s = 0.5
 
+    items: list[tuple[int, str]] = []
+    for idx, txt in enumerate(texts):
+        cleaned = _normalize_text(txt)
+        if not cleaned:
+            continue
+        items.append((idx, cleaned))
+
+    if not items:
+        return []
+
     for attempt in range(1, max_attempts + 1):
         start = time.perf_counter()
         try:
-            vectors = client.embed(texts)
+            results = _embed_with_split(items, client=client, provider=provider)
             duration_ms = int((time.perf_counter() - start) * 1000)
             log.info(
                 "embedding_batch_complete",
                 provider=provider,
-                batch_size=len(texts),
+                batch_size=len(items),
+                embedded=len(results),
                 duration_ms=duration_ms,
             )
-            return vectors
+            return results
         except Exception as exc:  # noqa: BLE001
             log.warning(
                 "embedding_batch_failed",
                 provider=provider,
-                batch_size=len(texts),
+                batch_size=len(items),
                 attempt=attempt,
                 error=str(exc),
             )
@@ -56,6 +104,7 @@ def embed_texts(texts: list[str]) -> list[list[float]]:
                 raise
             time.sleep(delay_s)
             delay_s *= 2
+    return []
 
 
 def get_qdrant_client() -> QdrantClient:
@@ -192,10 +241,13 @@ def upsert_chunks(
     client = get_qdrant_client()
     total = 0
     batch_size = max(1, int(getattr(settings, "embedding_batch_size", DEFAULT_EMBEDDING_BATCH_SIZE)))
+    if settings.embedding_provider == "together":
+        batch_size = min(batch_size, 8)
     for batch_chunks in _batch(chunks, batch_size):
         vectors = embed_texts([c.text for c in batch_chunks])
         points: list[PointStruct] = []
-        for chunk, vector in zip(batch_chunks, vectors):
+        for idx, vector in vectors:
+            chunk = batch_chunks[idx]
             points.append(
                 PointStruct(
                     id=str(chunk.id),
@@ -207,8 +259,9 @@ def upsert_chunks(
                     ),
                 )
             )
-        client.upsert(collection_name=settings.qdrant_collection, points=points)
-        total += len(points)
+        if points:
+            client.upsert(collection_name=settings.qdrant_collection, points=points)
+            total += len(points)
     log.info(
         "qdrant_upsert_complete",
         document_id=document.id,
@@ -224,6 +277,8 @@ def upsert_document_chunks(
     settings = get_settings()
     client = get_qdrant_client()
     batch_size = max(1, int(getattr(settings, "embedding_batch_size", DEFAULT_EMBEDDING_BATCH_SIZE)))
+    if settings.embedding_provider == "together":
+        batch_size = min(batch_size, 8)
     total = 0
     last_id: str | None = None
 
@@ -239,7 +294,8 @@ def upsert_document_chunks(
             last_id = batch_chunks[-1].id
             vectors = embed_texts([c.text for c in batch_chunks])
             points: list[PointStruct] = []
-            for chunk, vector in zip(batch_chunks, vectors):
+            for idx, vector in vectors:
+                chunk = batch_chunks[idx]
                 points.append(
                     PointStruct(
                         id=str(chunk.id),
@@ -251,8 +307,9 @@ def upsert_document_chunks(
                         ),
                     )
                 )
-            client.upsert(collection_name=settings.qdrant_collection, points=points)
-            total += len(points)
+            if points:
+                client.upsert(collection_name=settings.qdrant_collection, points=points)
+                total += len(points)
 
     log.info(
         "qdrant_upsert_complete",
