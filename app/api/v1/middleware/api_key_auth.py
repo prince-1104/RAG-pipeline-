@@ -37,6 +37,8 @@ class APIKeyMiddleware(BaseHTTPMiddleware):
         
         # Skip authentication for health check, docs, and static files
         skip_paths = [
+            "/health",
+            "/healthz",
             "/v1/health",
             "/v1/healthz",
             "/api/v1/health",

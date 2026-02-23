@@ -18,10 +18,14 @@ class DifficultyMix(BaseModel):
 
 
 class QuestionConstraints(BaseModel):
+    board: str | None = "CBSE"
     class_level: int = Field(..., ge=1, le=12)
     subject: str
     chapters: list[str] = Field(..., min_length=1)
+    chapter_number: int | None = None
+    syllabus_version: str | None = None
     language: Literal["en", "hi"] = "en"
+    per_chapter: bool = False
 
 
 class Blueprint(BaseModel):

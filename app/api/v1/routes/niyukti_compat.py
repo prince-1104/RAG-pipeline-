@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import re
+
 from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
+from sqlalchemy import func
 
 from app.api.v1.schemas.generation import GenerateRequest, GenerateResponse
 from app.api.v1.schemas.ingest import PDFIngestResponse
@@ -10,7 +13,7 @@ from app.api.v1.schemas.niyukti_compat import (
     NiyuktiGenerateResponse,
     NiyuktiQuestionResponse,
 )
-from app.db.models import Corpus, QuestionPoolStatus
+from app.db.models import Corpus, GeneratedQuestion, PoolQuestion, QuestionPool, QuestionPoolStatus
 from app.db.session import get_session
 from app.settings import get_settings
 
@@ -57,6 +60,8 @@ async def ingest_pdf_niyukti(
     class_level: int = Form(..., ge=1, le=12, description="Class level (1-12)"),
     subject: str = Form(..., description="Subject name"),
     chapter: str | None = Form(None, description="Chapter name (optional)"),
+    chapter_name: str | None = Form(None, description="Chapter title/name (optional)"),
+    chapter_number: int | None = Form(None, description="Chapter number (optional)"),
 ):
     """
     PDF ingestion endpoint for Niyukti platform compatibility.
@@ -81,13 +86,28 @@ async def ingest_pdf_niyukti(
         class_level=class_level,
         subject=subject,
         chapter=chapter,
+        chapter_name=chapter_name,
+        chapter_number=chapter_number,
         tenant_id=tenant_id,
         filename=file.filename if file else None,
         path=str(request.url.path),
     )
     
     # Delegate to the main ingest implementation with tenant_id
-    return await ingest_pdf(file, doc_id, board, class_level, subject, chapter, tenant_id)
+    return await ingest_pdf(
+        file,
+        doc_id,
+        board,
+        class_level,
+        subject,
+        chapter,
+        chapter_name,
+        chapter_number,
+        None,
+        None,
+        None,
+        tenant_id,
+    )
 
 
 @router.post("/ingest/pdf", response_model=PDFIngestResponse)
@@ -99,12 +119,27 @@ async def ingest_pdf_niyukti_pdf(
     class_level: int = Form(..., ge=1, le=12, description="Class level (1-12)"),
     subject: str = Form(..., description="Subject name"),
     chapter: str | None = Form(None, description="Chapter name (optional)"),
+    chapter_name: str | None = Form(None, description="Chapter title/name (optional)"),
+    chapter_number: int | None = Form(None, description="Chapter number (optional)"),
 ):
     """
     Compatibility alias for Niyukti: POST /api/v1/ingest/pdf.
     """
     tenant_id = request.headers.get("X-Tenant-ID", "niyukti-platform")
-    return await ingest_pdf(file, doc_id, board, class_level, subject, chapter, tenant_id)
+    return await ingest_pdf(
+        file,
+        doc_id,
+        board,
+        class_level,
+        subject,
+        chapter,
+        chapter_name,
+        chapter_number,
+        None,
+        None,
+        None,
+        tenant_id,
+    )
 
 
 @router.get("/ingest/stats")
@@ -205,6 +240,22 @@ def _map_subject_name(subject: str) -> str:
             return value
     # Return capitalized version if no mapping found
     return subject.capitalize()
+
+
+def _parse_chapter_number(value: str | int | None) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    raw = str(value).strip()
+    if not raw:
+        return None
+    if raw.isdigit():
+        return int(raw)
+    match = re.search(r"(?:chapter|unit|ch)\s*(\d+)", raw.lower())
+    if match:
+        return int(match.group(1))
+    return None
 
 
 def _convert_niyukti_to_blueprint(req: NiyuktiGenerateRequest, tenant_id: str, corpus_id: str) -> GenerateRequest:
@@ -463,14 +514,15 @@ def get_pool_status_endpoint(
             last_error: str | None = None
 
             for ch in chapters:
+                chapter_num = _parse_chapter_number(ch)
                 pool = session.exec(
                     select(QuestionPool).where(
                         QuestionPool.syllabus == syllabus,
                         QuestionPool.class_level == class_level,
                         QuestionPool.subject == mapped_subject,
-                        QuestionPool.chapter == ch,
                         QuestionPool.difficulty == difficulty,
                         QuestionPool.syllabus_version == syllabus_version,
+                        *([QuestionPool.chapter_number == chapter_num] if chapter_num is not None else [QuestionPool.chapter == ch]),
                     )
                 ).first()
 
@@ -557,6 +609,7 @@ def _convert_response_to_niyukti_format(
             question_type=question_type,
             class_level=class_level,
             subject=subject.lower(),
+            serial_no=getattr(q, "serial_no", 0),
         )
         
         if question_type == "mcq":
@@ -609,13 +662,91 @@ def _generate_questions_niyukti_impl(request: Request, req: NiyuktiGenerateReque
 
     try:
         from app.observability.logging import log
+        import time
 
-        # Resolve corpus: X-Corpus-ID is required for institute requests
-        tenant_id = request.headers.get("X-Tenant-ID")
+        # #region agent log
+        def _dbg(hypothesis_id: str, location: str, message: str, data: dict) -> None:
+            try:
+                payload = {
+                    "sessionId": "debug-session",
+                    "runId": "run1",
+                    "hypothesisId": hypothesis_id,
+                    "location": location,
+                    "message": message,
+                    "data": data,
+                    "timestamp": int(time.time() * 1000),
+                }
+                with open(r"d:\Hopper\NMC projects\RAG-QNA\niyukti-que-gen-Engine\.cursor\debug.log", "a", encoding="utf-8") as f:
+                    f.write(json.dumps(payload) + "\n")
+            except Exception:
+                pass
+        # #endregion
+
+        # Resolve corpus: X-Corpus-ID is optional; fallback to metadata lookup.
+        tenant_id = request.headers.get("X-Tenant-ID", "niyukti-platform")
         corpus_id = request.headers.get("X-Corpus-ID")
 
+        mapped_subject = _map_subject_name(req.subject)
+        # #region agent log
+        _dbg(
+            "A",
+            "niyukti_compat.py:resolve_corpus",
+            "request_metadata",
+            {
+                "tenant_id": tenant_id,
+                "corpus_id": corpus_id,
+                "board": req.board,
+                "class_level": req.class_level,
+                "subject": req.subject,
+                "mapped_subject": mapped_subject,
+                "chapter": req.chapter,
+            },
+        )
+        # #endregion
+
         if not corpus_id:
-            raise HTTPException(status_code=400, detail="missing_corpus_id")
+            if req.board is None:
+                raise HTTPException(status_code=400, detail="missing_corpus_metadata")
+
+            board_norm = str(req.board).strip().lower()
+            chapter_norm = str(req.chapter).strip() if req.chapter is not None else None
+            if not board_norm:
+                raise HTTPException(status_code=400, detail="missing_corpus_metadata")
+
+            from sqlmodel import select
+
+            def _lookup_corpus_ids(tenant_value: str) -> list[str]:
+                with get_session() as session:
+                    query = (
+                        select(Corpus.id)
+                        .join(GeneratedQuestion, GeneratedQuestion.corpus_id == Corpus.id)
+                        .where(Corpus.tenant_id == tenant_value)
+                        .where(func.lower(Corpus.board) == board_norm)
+                        .where(GeneratedQuestion.class_level == req.class_level)
+                        .where(func.lower(GeneratedQuestion.subject) == mapped_subject.lower())
+                        .distinct()
+                    )
+                    if chapter_norm:
+                        query = query.where(GeneratedQuestion.chapter == chapter_norm)
+                    return [str(cid) for cid in session.exec(query).all()]
+
+            rows = _lookup_corpus_ids(tenant_id)
+            if not rows and tenant_id != "niyukti-platform":
+                rows = _lookup_corpus_ids("niyukti-platform")
+
+            if not rows:
+                raise HTTPException(status_code=404, detail="no_corpus_found_for_metadata")
+            if len(rows) > 1:
+                raise HTTPException(status_code=409, detail="multiple_corpus_matches")
+            corpus_id = str(rows[0])
+            # #region agent log
+            _dbg(
+                "A",
+                "niyukti_compat.py:resolve_corpus",
+                "resolved_corpus_id",
+                {"corpus_id": corpus_id, "rows": rows},
+            )
+            # #endregion
 
         with get_session() as session:
             corpus = session.get(Corpus, corpus_id)
@@ -631,7 +762,6 @@ def _generate_questions_niyukti_impl(request: Request, req: NiyuktiGenerateReque
                 )
         
         # PRODUCTION FLOW: Redis → DB → Background Job (NO LLM on user request)
-        mapped_subject = _map_subject_name(req.subject)
         syllabus = "CBSE"  # Default syllabus, can be made configurable
         syllabus_version = "2024"  # Default version
         
@@ -643,16 +773,41 @@ def _generate_questions_niyukti_impl(request: Request, req: NiyuktiGenerateReque
             difficulty_mix["medium"] = req.medium_count or 0
         if req.hard_count is not None:
             difficulty_mix["hard"] = req.hard_count or 0
+
+        mcq_count = req.mcq_count
+        descriptive_count = req.descriptive_count
+        if mcq_count == 0 and descriptive_count == 0 and req.question_count:
+            ratio = req.mcq_ratio if req.mcq_ratio is not None else 0.7
+            if ratio > 1:
+                ratio = ratio / 100.0
+            ratio = max(0.0, min(1.0, float(ratio)))
+            mcq_count = int(req.question_count * ratio)
+            descriptive_count = max(0, int(req.question_count) - mcq_count)
+            if req.question_count > 0 and mcq_count == 0 and descriptive_count == 0:
+                mcq_count = 1
+                descriptive_count = max(0, int(req.question_count) - 1)
         
         # Fallback to auto-distribution if no difficulty counts provided
         if not difficulty_mix:
-            total = req.mcq_count + req.descriptive_count
+            total = mcq_count + descriptive_count
             if total > 0:
                 difficulty_mix = {
                     "easy": max(1, int(total * 0.4)),
                     "medium": max(1, int(total * 0.4)),
                     "hard": max(0, total - int(total * 0.4) - int(total * 0.4)),
                 }
+        # #region agent log
+        _dbg(
+            "B",
+            "niyukti_compat.py:difficulty_mix",
+            "computed_difficulty_mix",
+            {
+                "mcq_count": mcq_count,
+                "descriptive_count": descriptive_count,
+                "difficulty_mix": difficulty_mix,
+            },
+        )
+        # #endregion
         log.info(
             "niyukti_generate_request_difficulty_mix",
             class_level=req.class_level,
@@ -660,129 +815,210 @@ def _generate_questions_niyukti_impl(request: Request, req: NiyuktiGenerateReque
             difficulty_mix=difficulty_mix,
             corpus_id=corpus_id,
         )
+
+        # Optional incremental sync: only return questions with serial_no > header value.
+        after_serial_raw = request.headers.get("X-After-Serial-No")
+        after_serial: int | None = None
+        if after_serial_raw is not None and str(after_serial_raw).strip():
+            try:
+                after_serial = int(str(after_serial_raw).strip())
+            except ValueError:
+                pass
         
-        # STEP A: Check Redis (hot path)
+        # DB-only serving: bypass Redis/pools for now.
         all_questions = []
         pool_info = {}
         pool_info_by_chapter: dict[str, dict[str, str]] = {}
         needs_generation = False
         chapters = None
+        chapter_numbers: list[int] | None = None
+        if req.chapter is not None and str(req.chapter).strip():
+            chapters = [str(req.chapter).strip()]
+            parsed = _parse_chapter_number(req.chapter)
+            chapter_numbers = [parsed] if parsed is not None else None
         
         for difficulty, count in difficulty_mix.items():
             if count <= 0:
                 continue
             
-            # Try to get questions from Redis pool
-            from app.pools.service import (
-                get_pool_status,
-                get_or_create_pool,
-                get_questions_from_difficulty_pool,
-                list_pool_chapters,
-            )
-
-            if chapters is None:
-                chapters = list_pool_chapters(corpus_id, req.class_level, mapped_subject)
-            pool_info_by_chapter[difficulty] = {}
-            pool_statuses: list[str] = []
+            from sqlmodel import select
 
             count_remaining = count
-            for chapter in chapters:
-                pool = get_or_create_pool(
-                    syllabus,
-                    req.class_level,
-                    mapped_subject,
-                    chapter,
-                    difficulty,
-                    syllabus_version,
+            with get_session() as session:
+                pool_query = (
+                    select(PoolQuestion)
+                    .join(QuestionPool, PoolQuestion.pool_id == QuestionPool.id)
+                    .where(QuestionPool.syllabus == syllabus)
+                    .where(QuestionPool.class_level == req.class_level)
+                    .where(QuestionPool.subject == mapped_subject)
+                    .where(QuestionPool.difficulty == difficulty)
+                    .where(QuestionPool.syllabus_version == syllabus_version)
                 )
-                pool_info_by_chapter[difficulty][chapter] = pool.id
-                pool_status = get_pool_status(
-                    syllabus,
-                    req.class_level,
-                    mapped_subject,
-                    chapter,
-                    difficulty,
-                    syllabus_version,
+                if after_serial is not None:
+                    pool_query = pool_query.where(PoolQuestion.serial_no > after_serial)
+                if chapters:
+                    if chapter_numbers:
+                        pool_query = pool_query.where(QuestionPool.chapter_number.in_(chapter_numbers))
+                    else:
+                        pool_query = pool_query.where(QuestionPool.chapter.in_(chapters))
+                pool_query = pool_query.order_by(PoolQuestion.serial_no.asc())
+                db_questions = session.exec(pool_query.limit(count_remaining)).all()
+                # #region agent log
+                _dbg(
+                    "C",
+                    "niyukti_compat.py:db_poolquery",
+                    "poolquestion_results",
+                    {
+                        "difficulty": difficulty,
+                        "requested": count,
+                        "returned": len(db_questions),
+                        "chapters": chapters,
+                    },
                 )
-                pool_statuses.append(pool_status.value if pool_status else "pending")
-            
-            if any(status in (QuestionPoolStatus.ready.value, QuestionPoolStatus.ready_partial.value) for status in pool_statuses):
-                redis_questions = get_questions_from_difficulty_pool(
-                    syllabus=syllabus,
-                    class_level=req.class_level,
-                    subject=mapped_subject,
-                    difficulty=difficulty,
-                    syllabus_version=syllabus_version,
-                    count=count_remaining,
-                )
-                if redis_questions:
-                    for pq in redis_questions:
-                        q_data = json.loads(pq.question_json)
-                        all_questions.append(q_data)
-                    count_remaining -= len(redis_questions)
+                # #endregion
+                for pq in db_questions[:count_remaining]:
+                    q_data = json.loads(pq.question_json)
+                    if pq.serial_no is not None:
+                        q_data["serial_no"] = pq.serial_no
+                    else:
+                        q_data["serial_no"] = 0
+                    all_questions.append(q_data)
+                count_remaining -= len(db_questions)
 
-            if count_remaining <= 0:
-                pool_info[difficulty] = next(iter(pool_info_by_chapter[difficulty].values()))
-                continue
-
-            # STEP B: Check DB (cold but safe)
-            for chapter in chapters:
-                if count_remaining <= 0:
-                    break
-                pool_status = get_pool_status(syllabus, req.class_level, mapped_subject, chapter, difficulty, syllabus_version)
-
-                if pool_status == "ready":
-                    pool = get_or_create_pool(syllabus, req.class_level, mapped_subject, chapter, difficulty, syllabus_version)
-                    pool_info[difficulty] = pool.id
-
-                    # Trigger async Redis rebuild
-                    from app.pools.rebuild import rebuild_redis_pool_async
-                    import threading
-                    threading.Thread(target=rebuild_redis_pool_async, args=(pool.id,), daemon=True).start()
-
-                    # Fetch from DB while Redis rebuilds
-                    from sqlmodel import select
-                    from app.db.models import PoolQuestion
-
-                    with get_session() as session:
-                        db_questions = session.exec(
-                            select(PoolQuestion)
-                            .where(PoolQuestion.pool_id == pool.id)
-                            .limit(count_remaining)
-                        ).all()
-
-                        for pq in db_questions[:count_remaining]:
-                            q_data = json.loads(pq.question_json)
+                if count_remaining > 0:
+                    legacy_query = (
+                        select(GeneratedQuestion)
+                        .where(GeneratedQuestion.corpus_id == corpus_id)
+                        .where(GeneratedQuestion.class_level == req.class_level)
+                        .where(func.lower(GeneratedQuestion.subject) == mapped_subject.lower())
+                        .where(GeneratedQuestion.difficulty == difficulty)
+                        .order_by(GeneratedQuestion.created_at.desc())
+                        .limit(count_remaining)
+                    )
+                    if after_serial is not None:
+                        legacy_query = legacy_query.where(GeneratedQuestion.serial_no > after_serial)
+                    if chapters:
+                        legacy_query = legacy_query.where(GeneratedQuestion.chapter.in_(chapters))
+                    rows = session.exec(legacy_query).all()
+                    # #region agent log
+                    _dbg(
+                        "D",
+                        "niyukti_compat.py:db_generatedquery",
+                        "generatedquestion_results",
+                        {
+                            "difficulty": difficulty,
+                            "requested": count_remaining,
+                            "returned": len(rows),
+                            "chapters": chapters,
+                        },
+                    )
+                    # #endregion
+                    for gq in rows:
+                        try:
+                            q_data = json.loads(gq.question_json)
+                            if gq.serial_no is not None:
+                                q_data["serial_no"] = gq.serial_no
+                            else:
+                                q_data["serial_no"] = 0
                             all_questions.append(q_data)
-                        count_remaining -= len(db_questions)
+                        except (json.JSONDecodeError, TypeError):
+                            continue
+                    count_remaining -= len(rows)
 
             if count_remaining > 0:
-                # STEP C: Do NOT trigger generation for institute requests
                 needs_generation = True
-                pool_info[difficulty] = next(iter(pool_info_by_chapter[difficulty].values()))
+        # #region agent log
+        _dbg(
+            "E",
+            "niyukti_compat.py:response",
+            "final_question_counts",
+            {
+                "total_requested": sum(max(0, int(v)) for v in difficulty_mix.values()),
+                "total_returned": len(all_questions),
+                "needs_generation": needs_generation,
+            },
+        )
+        # #endregion
         
+        total_requested = sum(max(0, int(v)) for v in difficulty_mix.values())
+
+        # Final fallback: serve from legacy GeneratedQuestion when pools are empty.
+        if (not all_questions) or (needs_generation and len(all_questions) < total_requested):
+            from sqlmodel import select
+
+            fallback_questions: list[dict] = []
+            with get_session() as session:
+                for difficulty, count in difficulty_mix.items():
+                    if count <= 0:
+                        continue
+                    stmt = (
+                        select(GeneratedQuestion)
+                        .where(GeneratedQuestion.corpus_id == corpus_id)
+                        .where(GeneratedQuestion.class_level == req.class_level)
+                        .where(func.lower(GeneratedQuestion.subject) == mapped_subject.lower())
+                        .where(GeneratedQuestion.difficulty == difficulty)
+                        .order_by(GeneratedQuestion.created_at.desc())
+                        .limit(count)
+                    )
+                    if after_serial is not None:
+                        stmt = stmt.where(GeneratedQuestion.serial_no > after_serial)
+                    if req.chapter is not None and str(req.chapter).strip():
+                        stmt = stmt.where(GeneratedQuestion.chapter == str(req.chapter).strip())
+                    rows = session.exec(stmt).all()
+                    for gq in rows:
+                        try:
+                            q_data = json.loads(gq.question_json)
+                            if gq.serial_no is not None:
+                                q_data["serial_no"] = gq.serial_no
+                            else:
+                                q_data["serial_no"] = 0
+                            fallback_questions.append(q_data)
+                        except (json.JSONDecodeError, TypeError):
+                            continue
+
+            if fallback_questions:
+                all_questions.extend(fallback_questions)
+
+        if total_requested > 0 and len(all_questions) >= total_requested:
+            needs_generation = False
+
         # Return response
         if all_questions and not needs_generation:
-            # Questions available - return immediately
+            # Order by serial_no ASC for incremental sync; then slice to requested count.
+            all_questions.sort(key=lambda q: q.get("serial_no", 0))
+            to_return = all_questions[:total_requested] if total_requested > 0 else all_questions
             niyukti_response = _convert_pool_questions_to_niyukti_format(
-                all_questions, req.class_level, req.subject
+                to_return,
+                req.class_level,
+                req.subject,
             )
+            # #region agent log
+            _dbg(
+                "F",
+                "niyukti_compat.py:response",
+                "niyukti_response_built",
+                {
+                    "questions_len": len(niyukti_response.questions or []),
+                    "question_sample_keys": list((niyukti_response.questions[0].model_dump().keys() if niyukti_response.questions else [])),
+                },
+            )
+            # #endregion
             return niyukti_response
-        else:
-            # Need to generate - return 202 Accepted
-            from fastapi.responses import JSONResponse
-            return JSONResponse(
-                status_code=202,
-                content={
-                    "status": "generating",
-                    "message": "questions_are_being_generated_please_check_back_shortly",
-                    "pool_info": pool_info,
-                    "pool_info_by_chapter": pool_info_by_chapter,
-                    "corpus_id": corpus_id,
-                    "class_level": req.class_level,
-                    "subject": req.subject,
-                }
-            )
+
+        # Need to generate - return 202 Accepted
+        from fastapi.responses import JSONResponse
+        return JSONResponse(
+            status_code=202,
+            content={
+                "status": "generating",
+                "message": "questions_are_being_generated_please_check_back_shortly",
+                "pool_info": pool_info,
+                "pool_info_by_chapter": pool_info_by_chapter,
+                "corpus_id": corpus_id,
+                "class_level": req.class_level,
+                "subject": req.subject,
+            }
+        )
 
     except HTTPException as http_exc:
         # Re-raise HTTPExceptions as-is (they'll be caught by handler)

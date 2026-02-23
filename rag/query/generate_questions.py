@@ -40,11 +40,14 @@ from __future__ import annotations
 import json
 from typing import Any, Literal
 
+import httpx
 from qdrant_client import QdrantClient
 from qdrant_client.models import FieldCondition, Filter, MatchValue
 
 from app.embeddings.factory import get_embedding_client
+from app.llm.gemini import GeminiClient
 from app.observability.logging import log
+from app.observability.agentbill import finalize_event, start_event
 from app.settings import get_settings
 
 
@@ -54,6 +57,28 @@ TOP_K_DEFAULT = 16
 
 Difficulty = Literal["easy", "medium", "hard"]
 QuestionType = Literal["mcq", "descriptive"]
+
+RAG_QUESTION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "questions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "stem": {"type": "string"},
+                    "options": {"type": ["array", "null"], "items": {"type": "string"}},
+                    "answer": {"type": "string"},
+                    "qtype": {"type": "string"},
+                    "difficulty": {"type": "string"},
+                },
+                "required": ["stem", "answer", "qtype", "difficulty"],
+            },
+        },
+        "note": {"type": "string"},
+    },
+    "required": ["questions"],
+}
 
 
 # -----------------------------------------------------------------------------
@@ -93,12 +118,28 @@ def _qdrant_search(
     Compatibility wrapper for qdrant-client API differences.
     Returns list of scored points.
     """
+    if hasattr(client, "search_points"):
+        try:
+            resp = client.search_points(
+                collection_name=collection,
+                vector=vector,
+                filter=flt,
+                limit=limit,
+                with_payload=True,
+            )
+        except TypeError:
+            resp = client.search_points(
+                collection_name=collection,
+                query_vector=vector,
+                query_filter=flt,
+                limit=limit,
+            )
+        return resp.points if hasattr(resp, "points") else resp
     if hasattr(client, "query_points"):
         try:
             resp = client.query_points(
                 collection_name=collection,
                 query=vector,
-                filter=flt,
                 limit=limit,
                 with_payload=True,
             )
@@ -106,18 +147,9 @@ def _qdrant_search(
             resp = client.query_points(
                 collection_name=collection,
                 query_vector=vector,
-                query_filter=flt,
                 limit=limit,
                 with_payload=True,
             )
-        return resp.points if hasattr(resp, "points") else resp
-    if hasattr(client, "search_points"):
-        resp = client.search_points(
-            collection_name=collection,
-            query_vector=vector,
-            query_filter=flt,
-            limit=limit,
-        )
         return resp.points if hasattr(resp, "points") else resp
     return client.search(
         collection_name=collection,
@@ -293,66 +325,159 @@ def generate_questions(
     )
 
     settings = get_settings()
-    api_key = getattr(settings, "llm_api_key", None) or getattr(
-        settings, "openrouter_api_key", None
-    )
-    if not api_key or not str(api_key).strip():
-        raise ValueError("llm_api_key or LLM_API_KEY (or openrouter) required for runtime RAG")
+    openai_api_key = getattr(settings, "openai_api_key", None)
+    openrouter_api_key = getattr(settings, "openrouter_api_key", None)
+    llm_api_key = getattr(settings, "llm_api_key", None)
+    gemini_api_key = getattr(settings, "gemini_api_key", None)
 
-    model = getattr(settings, "llm_model", None) or getattr(
-        settings, "openrouter_model", "openai/gpt-4o-mini"
-    )
-    base_url = (
-        getattr(settings, "llm_base_url", None)
-        or getattr(settings, "openrouter_base_url", None)
-        or "https://openrouter.ai/api/v1"
-    ).rstrip("/")
-    url = f"{base_url}/chat/completions"
-
-    payload: dict[str, Any] = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        "temperature": 0.2,
-        "max_tokens": 4096,
-        "response_format": {"type": "json_object"},
-    }
-
-    with httpx.Client(timeout=60.0) as client:
-        resp = client.post(
-            url,
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {api_key}",
-            },
-            json=payload,
+    def _call_openai(
+        *,
+        api_key: str,
+        model: str,
+        base_url: str,
+        provider: str,
+    ) -> dict[str, Any]:
+        url = f"{base_url.rstrip('/')}/chat/completions"
+        payload: dict[str, Any] = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "temperature": 0.2,
+            "max_tokens": 4096,
+            "response_format": {"type": "json_object"},
+        }
+        event = start_event(
+            event_name="ai_completion",
+            provider=provider,
+            model=model,
+            kind="completion",
         )
-
-    if resp.status_code != 200:
-        err_body = (resp.text or "")[:500]
-        log.error(
-            "rag_llm_error",
-            status=resp.status_code,
-            body=err_body,
+        with httpx.Client(timeout=60.0) as client:
+            resp = client.post(
+                url,
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {api_key}",
+                },
+                json=payload,
+            )
+        if resp.status_code != 200:
+            finalize_event(
+                event,
+                success=False,
+                error=f"{provider}_http_{resp.status_code}",
+            )
+            err_body = (resp.text or "")[:500]
+            raise RuntimeError(
+                f"LLM API failed: status={resp.status_code} body={err_body}"
+            )
+        data = resp.json()
+        usage = data.get("usage") if isinstance(data, dict) else None
+        input_tokens = None
+        output_tokens = None
+        total_tokens = None
+        if isinstance(usage, dict):
+            input_tokens = usage.get("prompt_tokens")
+            output_tokens = usage.get("completion_tokens")
+            total_tokens = usage.get("total_tokens")
+        try:
+            raw = data["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError) as e:
+            finalize_event(
+                event,
+                success=False,
+                error=f"{provider}_missing_content",
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                total_tokens=total_tokens,
+            )
+            raise RuntimeError(f"LLM response missing content: {e}") from e
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as e:
+            finalize_event(
+                event,
+                success=False,
+                error=f"{provider}_invalid_json",
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                total_tokens=total_tokens,
+            )
+            raise RuntimeError(f"LLM did not return valid JSON: {e}") from e
+        finalize_event(
+            event,
+            success=True,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            total_tokens=total_tokens,
+            attributes={"ai.response_id": data.get("id")},
         )
+        return parsed
+
+    def _call_gemini(*, api_key: str, model: str) -> dict[str, Any]:
+        client = GeminiClient(api_key=api_key, model=model)
+        result = client.generate_json(
+            system_prompt=system,
+            user_prompt=user,
+            json_schema=RAG_QUESTION_SCHEMA,
+        )
+        if not isinstance(result.parsed_json, dict):
+            raise RuntimeError("gemini_invalid_json_output: expected object")
+        return result.parsed_json
+
+    parsed: dict[str, Any] | None = None
+    errors: list[str] = []
+
+    # Primary: OpenAI (direct)
+    if openai_api_key and str(openai_api_key).strip():
+        try:
+            parsed = _call_openai(
+                api_key=openai_api_key,
+                model=getattr(settings, "openai_model", "gpt-4o-mini"),
+                base_url=getattr(settings, "openai_base_url", None)
+                or "https://api.openai.com/v1",
+                provider="openai",
+            )
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"openai_failed:{str(exc)[:200]}")
+            log.warning("rag_openai_failed_fallback", error=str(exc))
+
+    # Secondary: Gemini fallback
+    if parsed is None and gemini_api_key and str(gemini_api_key).strip():
+        try:
+            parsed = _call_gemini(
+                api_key=gemini_api_key,
+                model=getattr(settings, "gemini_model", "gemini-2.5-flash"),
+            )
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"gemini_failed:{str(exc)[:200]}")
+            log.error("rag_gemini_failed", error=str(exc))
+
+    # Optional: OpenRouter/LLM API key (legacy)
+    if parsed is None:
+        api_key = (llm_api_key or openrouter_api_key or "").strip()
+        if api_key:
+            try:
+                parsed = _call_openai(
+                    api_key=api_key,
+                    model=getattr(settings, "llm_model", None)
+                    or getattr(settings, "openrouter_model", "openai/gpt-4o-mini"),
+                    base_url=getattr(settings, "llm_base_url", None)
+                    or getattr(settings, "openrouter_base_url", None)
+                    or "https://openrouter.ai/api/v1",
+                    provider="openrouter",
+                )
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"openrouter_failed:{str(exc)[:200]}")
+                log.error("rag_openrouter_failed", error=str(exc))
+
+    if parsed is None:
         raise RuntimeError(
-            f"LLM API failed: status={resp.status_code} body={err_body}"
+            "llm_api_key or LLM_API_KEY (or openai/gemini) required for runtime RAG; "
+            f"errors={errors}"
         )
-
-    data = resp.json()
-    try:
-        raw = data["choices"][0]["message"]["content"]
-    except (KeyError, IndexError, TypeError) as e:
-        log.error("rag_llm_parse", error=str(e), response_keys=list(data.keys()))
-        raise RuntimeError(f"LLM response missing content: {e}") from e
-
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError as e:
-        log.error("rag_llm_json_decode", error=str(e), raw_preview=raw[:200])
-        raise RuntimeError(f"LLM did not return valid JSON: {e}") from e
 
     questions = parsed.get("questions")
     if not isinstance(questions, list):

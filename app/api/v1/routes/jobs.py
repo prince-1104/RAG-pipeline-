@@ -3,7 +3,7 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException, Request
 
 from app.api.v1.schemas.jobs import JobStatusResponse
-from app.db.models import GenerationJob
+from app.db.models import GenerationJob, JobStatus
 from app.db.session import get_session
 
 
@@ -20,8 +20,12 @@ def get_job(request: Request, job_id: str):
             raise HTTPException(status_code=404, detail="job_not_found")
         
         err = None
-        if job.status.value == "FAILED":
-            err = {"code": job.error_code or "JOB_FAILED", "message": job.error_message or "job_failed"}
+        if job.status in (JobStatus.failed_retryable, JobStatus.failed_terminal):
+            err = {
+                "code": job.error_code or "JOB_FAILED",
+                "message": job.error_message or job.last_error or "job_failed",
+                "retryable": job.status == JobStatus.failed_retryable,
+            }
         
         # Parse result_json as result/progress
         result = None

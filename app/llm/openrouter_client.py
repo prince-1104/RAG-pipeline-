@@ -7,6 +7,7 @@ import httpx
 
 from app.llm.base import LLMResult
 from app.llm.stub import StubLLMClient
+from app.observability.agentbill import finalize_event, start_event
 
 
 class OpenRouterClient:
@@ -66,6 +67,12 @@ class OpenRouterClient:
             "response_format": {"type": "json_object"},  # Force JSON output
         }
 
+        event = start_event(
+            event_name="ai_completion",
+            provider="openrouter",
+            model=self.model,
+            kind="completion",
+        )
         last_exception: Exception | None = None
         last_status: int | None = None
         last_resp_text: str | None = None
@@ -82,12 +89,33 @@ class OpenRouterClient:
                     try:
                         text = data["choices"][0]["message"]["content"]
                         parsed = json.loads(text)
+                        usage = data.get("usage") if isinstance(data, dict) else None
+                        input_tokens = None
+                        output_tokens = None
+                        total_tokens = None
+                        if isinstance(usage, dict):
+                            input_tokens = usage.get("prompt_tokens")
+                            output_tokens = usage.get("completion_tokens")
+                            total_tokens = usage.get("total_tokens")
+                        finalize_event(
+                            event,
+                            success=True,
+                            input_tokens=input_tokens,
+                            output_tokens=output_tokens,
+                            total_tokens=total_tokens,
+                            attributes={"ai.response_id": data.get("id")},
+                        )
                         return LLMResult(raw_text=text, parsed_json=parsed)
                     except (KeyError, IndexError, json.JSONDecodeError) as e:
                         import logging
                         logger = logging.getLogger(__name__)
                         logger.error(f"Failed to parse OpenRouter response: {e}")
-                        # Fall through to stub fallback below
+                        finalize_event(
+                            event,
+                            success=False,
+                            error="openrouter_parse_failed",
+                        )
+                        raise RuntimeError(f"OpenRouter response parse failed: {e}") from e
 
                 # Handle errors - raise exceptions so FallbackLLMClient can catch and try Gemini
                 if resp.status_code == 401 or resp.status_code == 403:
@@ -100,6 +128,11 @@ class OpenRouterClient:
                     except Exception:
                         error_msg = resp.text[:200]
                     logger.error(f"OpenRouter API authentication failed: {error_msg}")
+                    finalize_event(
+                        event,
+                        success=False,
+                        error=f"openrouter_auth_{resp.status_code}",
+                    )
                     raise RuntimeError(f"OpenRouter API authentication failed: {error_msg}")
 
                 # For other errors, raise so fallback client can try Gemini
@@ -112,6 +145,11 @@ class OpenRouterClient:
                     except Exception:
                         error_msg = resp.text[:200]
                     logger.warning(f"OpenRouter API error (HTTP {resp.status_code}): {error_msg}")
+                    finalize_event(
+                        event,
+                        success=False,
+                        error=f"openrouter_http_{resp.status_code}",
+                    )
                     raise RuntimeError(f"OpenRouter API error (HTTP {resp.status_code}): {error_msg}")
 
         except httpx.HTTPStatusError as e:
@@ -121,8 +159,18 @@ class OpenRouterClient:
                 error_msg = error_data.get("error", {}).get("message", e.response.text[:200])
             except Exception:
                 error_msg = e.response.text[:200]
+            finalize_event(
+                event,
+                success=False,
+                error=f"openrouter_http_{e.response.status_code}",
+            )
             raise RuntimeError(f"OpenRouter API HTTP error ({e.response.status_code}): {error_msg}") from e
 
         except Exception as e:
             # Re-raise other exceptions so FallbackLLMClient can catch and try Gemini
+            finalize_event(
+                event,
+                success=False,
+                error="openrouter_request_failed",
+            )
             raise RuntimeError(f"OpenRouter API request failed: {str(e)[:200]}") from e

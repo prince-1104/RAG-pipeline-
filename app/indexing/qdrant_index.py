@@ -17,17 +17,17 @@ from qdrant_client.models import (
 from app.db.models import Chunk, Corpus, Document
 from app.db.session import get_session
 from app.embeddings.factory import get_embedding_client
+from app.indexing.chunker import count_tokens, truncate_to_tokens
 from app.observability.logging import log
 from app.settings import get_settings
 
-DEFAULT_EMBEDDING_BATCH_SIZE = 2
-EMBEDDING_MAX_CHARS = 2000
-
-
-def _normalize_text(text: str) -> str:
+DEFAULT_EMBEDDING_BATCH_SIZE = 8
+def _normalize_text(text: str, *, max_tokens: int) -> str:
     cleaned = text.encode("utf-8", "ignore").decode("utf-8").strip()
-    if len(cleaned) > EMBEDDING_MAX_CHARS:
-        cleaned = cleaned[:EMBEDDING_MAX_CHARS]
+    if not cleaned:
+        return ""
+    if count_tokens(cleaned) > max_tokens:
+        cleaned = truncate_to_tokens(cleaned, max_tokens)
     return cleaned
 
 
@@ -36,10 +36,17 @@ def _embed_with_split(
     *,
     client,
     provider: str,
+    hard_cap_tokens: int,
 ) -> list[tuple[int, list[float]]]:
     if not items:
         return []
-    texts = [t for _, t in items]
+    # Enforce hard cap on the FINAL payload we send to the embedding API.
+    texts: list[str] = []
+    for _, t in items:
+        payload = t
+        if count_tokens(payload) > hard_cap_tokens:
+            payload = truncate_to_tokens(payload, hard_cap_tokens)
+        texts.append(payload)
     try:
         vectors = client.embed(texts)
         return [(items[i][0], vec) for i, vec in enumerate(vectors)]
@@ -64,8 +71,9 @@ def embed_texts(texts: list[str]) -> list[tuple[int, list[float]]]:
     client = get_embedding_client()
 
     items: list[tuple[int, str]] = []
+    hard_cap_tokens = min(int(settings.embedding_hard_cap_tokens), 500)
     for idx, txt in enumerate(texts):
-        cleaned = _normalize_text(txt)
+        cleaned = _normalize_text(txt, max_tokens=hard_cap_tokens)
         if not cleaned:
             continue
         items.append((idx, cleaned))
@@ -73,18 +81,34 @@ def embed_texts(texts: list[str]) -> list[tuple[int, list[float]]]:
     if not items:
         return []
 
+    batch_size = max(1, int(getattr(settings, "embedding_batch_size", DEFAULT_EMBEDDING_BATCH_SIZE)))
+    if provider == "together":
+        batch_size = min(batch_size, 8)
+
+    out: list[tuple[int, list[float]]] = []
     start = time.perf_counter()
     try:
-        results = _embed_with_split(items, client=client, provider=provider)
-        duration_ms = int((time.perf_counter() - start) * 1000)
-        log.info(
-            "embedding_batch_complete",
-            provider=provider,
-            batch_size=len(items),
-            embedded=len(results),
-            duration_ms=duration_ms,
-        )
-        return results
+        for i in range(0, len(items), batch_size):
+            batch = items[i : i + batch_size]
+            batch_start = time.perf_counter()
+            results = _embed_with_split(
+                batch,
+                client=client,
+                provider=provider,
+                hard_cap_tokens=hard_cap_tokens,
+            )
+            duration_ms = int((time.perf_counter() - batch_start) * 1000)
+            log.info(
+                "embedding_batch_complete",
+                provider=provider,
+                batch_size=len(batch),
+                embedded=len(results),
+                duration_ms=duration_ms,
+            )
+            out.extend(results)
+        # Ensure stable ordering by original indices
+        out.sort(key=lambda x: x[0])
+        return out
     except Exception as exc:  # noqa: BLE001
         log.warning(
             "embedding_batch_failed",
@@ -124,6 +148,10 @@ def ensure_qdrant_payload_indexes() -> None:
         "subject": PayloadSchemaType.KEYWORD,
         "chapter": PayloadSchemaType.KEYWORD,
         "chapter_number": PayloadSchemaType.INTEGER,
+        "chapter_name": PayloadSchemaType.KEYWORD,
+        "language": PayloadSchemaType.KEYWORD,
+        "source_type": PayloadSchemaType.KEYWORD,
+        "difficulty_hint": PayloadSchemaType.KEYWORD,
     }
 
     collection = client.get_collection(collection_name=settings.qdrant_collection)
@@ -195,13 +223,13 @@ def _extract_chapter_number(chapter: str | None) -> int | None:
 def _chunk_payload(
     *, chunk: Chunk, corpus: Corpus, document: Document
 ) -> dict[str, object]:
-    chapter_number = _extract_chapter_number(chunk.chapter)
+    chapter_number = chunk.chapter_number or _extract_chapter_number(chunk.chapter)
     return {
         "chunk_id": chunk.id,
         "document_id": chunk.document_id,
         "corpus_id": chunk.corpus_id,
         "tenant_id": corpus.tenant_id,
-        "board": corpus.board,
+        "board": chunk.board or document.board or corpus.board,
         "syllabus": document.syllabus,
         "syllabus_version": document.syllabus_version,
         "class_level": chunk.class_level,
@@ -209,6 +237,10 @@ def _chunk_payload(
         "subject": chunk.subject,
         "chapter": chunk.chapter,
         "chapter_number": chapter_number,
+        "chapter_name": chunk.chapter_name or chunk.chapter,
+        "language": chunk.language or document.language,
+        "source_type": chunk.source_type or document.source_type,
+        "difficulty_hint": chunk.difficulty_hint or document.difficulty_hint,
         "page_start": chunk.page_start,
         "page_end": chunk.page_end,
         "text": chunk.text,

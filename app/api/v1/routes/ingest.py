@@ -31,6 +31,70 @@ def _get_ingest_semaphore() -> asyncio.Semaphore:
     return _INGEST_SEMAPHORE
 
 
+def _normalize_ingest_contract(
+    *,
+    board: str,
+    class_level: int,
+    subject: str,
+    chapter: str | None,
+    chapter_name: str | None,
+    chapter_number: int | None,
+    syllabus_version: str | None,
+    language: str | None,
+    source_type: str | None,
+) -> dict:
+    settings = get_settings()
+    chapter_str = (chapter or "").strip() or None
+    chapter_name_clean = (chapter_name or "").strip() or None
+    if not chapter_str:
+        if chapter_number is not None and chapter_name_clean:
+            chapter_str = f"Chapter {int(chapter_number)}: {chapter_name_clean}"
+        elif chapter_number is not None:
+            chapter_str = f"Chapter {int(chapter_number)}"
+        elif chapter_name_clean:
+            chapter_str = chapter_name_clean
+    return {
+        "board": str(board).strip() or "CBSE",
+        "class_level": int(class_level),
+        "subject": str(subject).strip(),
+        "chapter": chapter_str,
+        "chapter_name": chapter_name_clean,
+        "chapter_number": int(chapter_number) if chapter_number is not None else None,
+        "syllabus_version": (syllabus_version or "").strip() or settings.ingest_default_syllabus_version,
+        "language": (language or "").strip().lower() or settings.ingest_default_language,
+        "source_type": (source_type or "").strip().lower() or settings.ingest_default_source_type,
+    }
+
+
+def _validate_ingest_contract(tenant_id: str, doc_id: str, meta: dict) -> None:
+    settings = get_settings()
+    required = (
+        "board",
+        "class_level",
+        "subject",
+        "chapter_number",
+        "chapter_name",
+        "syllabus_version",
+        "language",
+        "source_type",
+    )
+    missing = [k for k in required if not meta.get(k)]
+    if not missing:
+        return
+    log.warning(
+        "ingest_metadata_missing",
+        tenant_id=tenant_id,
+        doc_id=doc_id,
+        missing=missing,
+        strict_mode=bool(settings.ingest_enforce_strict_metadata),
+    )
+    if settings.ingest_enforce_strict_metadata:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "missing_required_ingest_metadata", "missing_fields": missing},
+        )
+
+
 def _get_or_create_niyukti_corpus(tenant_id: str, board: str = "CBSE") -> str:
     """
     Get or create a default corpus for Niyukti tenant.
@@ -67,6 +131,11 @@ async def ingest_pdf(
     class_level: int = Form(..., ge=1, le=12, description="Class level (1-12)"),
     subject: str = Form(..., description="Subject name"),
     chapter: str | None = Form(None, description="Chapter name (optional)"),
+    chapter_name: str | None = Form(None, description="Chapter title/name (optional)"),
+    chapter_number: int | None = Form(None, description="Chapter number (optional)"),
+    syllabus_version: str | None = Form(None, description="Syllabus version"),
+    language: str | None = Form(None, description="Language"),
+    source_type: str | None = Form(None, description="Source type (e.g. pdf/scanned_pdf)"),
     tenant_id: str = Form(None, description="Tenant ID (defaults to 'niyukti-platform')"),
 ):
     """
@@ -88,13 +157,32 @@ async def ingest_pdf(
     if not tenant_id:
         tenant_id = "niyukti-platform"
     
-    log.info(
-        "pdf_ingest_endpoint_called",
-        doc_id=doc_id,
+    normalized_meta = _normalize_ingest_contract(
         board=board,
         class_level=class_level,
         subject=subject,
         chapter=chapter,
+        chapter_name=chapter_name,
+        chapter_number=chapter_number,
+        syllabus_version=syllabus_version,
+        language=language,
+        source_type=source_type,
+    )
+    _validate_ingest_contract(tenant_id, doc_id, normalized_meta)
+    chapter_str = normalized_meta["chapter"]
+
+    log.info(
+        "pdf_ingest_endpoint_called",
+        doc_id=doc_id,
+        board=normalized_meta["board"],
+        class_level=class_level,
+        subject=normalized_meta["subject"],
+        chapter=chapter_str,
+        chapter_name=normalized_meta["chapter_name"],
+        chapter_number=normalized_meta["chapter_number"],
+        syllabus_version=normalized_meta["syllabus_version"],
+        language=normalized_meta["language"],
+        source_type=normalized_meta["source_type"],
         tenant_id=tenant_id,
         filename=file.filename if file else None,
     )
@@ -154,10 +242,15 @@ async def ingest_pdf(
                 started_at=now,
                 request_json=json.dumps({
                     "doc_id": doc_id,
-                    "board": board,
+                    "board": normalized_meta["board"],
                     "class_level": class_level,
-                    "subject": subject,
-                    "chapter": chapter,
+                    "subject": normalized_meta["subject"],
+                    "chapter": chapter_str,
+                    "chapter_name": normalized_meta["chapter_name"],
+                    "chapter_number": normalized_meta["chapter_number"],
+                    "syllabus_version": normalized_meta["syllabus_version"],
+                    "language": normalized_meta["language"],
+                    "source_type": normalized_meta["source_type"],
                     "filename": file.filename,
                 }),
             )
@@ -170,18 +263,18 @@ async def ingest_pdf(
         try:
             store = get_object_store()
             storage_uri = await store.put_pdf_with_key_stream(
-                board=board,
+                board=normalized_meta["board"],
                 class_level=class_level,
-                subject=subject,
+                subject=normalized_meta["subject"],
                 doc_id=doc_id,
                 fileobj=file.file,
                 content_type=file.content_type,
             )
 
             # Get or create corpus for this tenant
-            corpus_id = _get_or_create_niyukti_corpus(tenant_id, board)
+            corpus_id = _get_or_create_niyukti_corpus(tenant_id, normalized_meta["board"])
             if not corpus_id:
-                log.error("corpus_creation_failed", tenant_id=tenant_id, board=board)
+                log.error("corpus_creation_failed", tenant_id=tenant_id, board=normalized_meta["board"])
                 raise HTTPException(status_code=500, detail="corpus_creation_failed")
             
             # Create Document record
@@ -191,8 +284,15 @@ async def ingest_pdf(
                     filename=f"{doc_id}.pdf",
                     storage_uri=storage_uri,
                     class_level=class_level,
-                    subject=subject,
-                    chapter=chapter,
+                    subject=normalized_meta["subject"],
+                    chapter=chapter_str,
+                    chapter_number=normalized_meta["chapter_number"],
+                    chapter_name=normalized_meta["chapter_name"],
+                    board=normalized_meta["board"],
+                    syllabus=normalized_meta["board"],
+                    syllabus_version=normalized_meta["syllabus_version"],
+                    language=normalized_meta["language"],
+                    source_type=normalized_meta["source_type"],
                     toc_json=None,  # TOC can be added later if available
                 )
                 session.add(document)
@@ -228,11 +328,11 @@ async def ingest_pdf(
                     log.error("index_job_missing_corpus_id", index_job_id=index_job_id, tenant_id=tenant_id)
                     raise HTTPException(status_code=500, detail="index_job_missing_corpus_id")
 
-            # Mark ingest job as succeeded (upload + DB records complete)
+            # Mark ingest job as completed (upload + DB records complete)
             with get_session() as session:
                 job = session.get(GenerationJob, job_id)
                 if job:
-                    job.status = JobStatus.succeeded
+                    job.status = JobStatus.completed
                     job.finished_at = datetime.utcnow()
                     job.result_json = json.dumps({
                         "storage_uri": storage_uri,
@@ -279,7 +379,7 @@ async def ingest_pdf(
                 with get_session() as session:
                     job = session.get(GenerationJob, job_id)
                     if job:
-                        job.status = JobStatus.failed
+                        job.status = JobStatus.failed_terminal
                         job.finished_at = datetime.utcnow()
                         job.error_code = "validation_error"
                         job.error_message = error_msg
@@ -298,7 +398,7 @@ async def ingest_pdf(
                 with get_session() as session:
                     job = session.get(GenerationJob, job_id)
                     if job:
-                        job.status = JobStatus.failed
+                        job.status = JobStatus.failed_terminal
                         job.finished_at = datetime.utcnow()
                         job.error_code = "ingest_error"
                         job.error_message = error_msg
@@ -318,7 +418,7 @@ async def ingest_pdf(
                 with get_session() as session:
                     job = session.get(GenerationJob, job_id)
                     if job:
-                        job.status = JobStatus.failed
+                        job.status = JobStatus.failed_terminal
                         job.finished_at = datetime.utcnow()
                         job.error_code = "upload_error"
                         job.error_message = error_msg
@@ -340,7 +440,7 @@ async def ingest_pdf(
                 with get_session() as session:
                     db_job = session.get(GenerationJob, job_id)
                     if db_job:
-                        db_job.status = JobStatus.failed
+                        db_job.status = JobStatus.failed_terminal
                         db_job.finished_at = datetime.utcnow()
                         db_job.error_code = "database_error"
                         db_job.error_message = str(e)
@@ -363,7 +463,7 @@ async def ingest_pdf(
                 with get_session() as session:
                     db_job = session.get(GenerationJob, job_id)
                     if db_job:
-                        db_job.status = JobStatus.failed
+                        db_job.status = JobStatus.failed_terminal
                         db_job.finished_at = datetime.utcnow()
                         db_job.error_code = "unexpected_error"
                         db_job.error_message = error_msg

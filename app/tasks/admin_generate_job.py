@@ -2,15 +2,14 @@ from __future__ import annotations
 
 import concurrent.futures
 import json
-import uuid
+import re
 from typing import Literal
 
 from app.api.v1.schemas.generation import Blueprint, DifficultyMix, QuestionConstraints
-from app.db.models import Chunk, PoolQuestion
+from app.db.models import Chunk, GeneratedQuestion, QuestionCitation
 from app.db.session import get_session
 from app.generation.sync import generate_questions_sync
 from app.observability.logging import log
-from app.pools.service import add_questions_to_pool, get_or_create_pool
 from app.settings import get_settings
 from sqlmodel import select
 
@@ -21,15 +20,14 @@ def run_admin_generate_job(job) -> dict:
     
     This is the ONLY place where LLM calls are allowed for question generation.
     Generates questions based on admin criteria and stores them in:
-    - Database (PoolQuestion table)
-    - Redis (for fast retrieval by institutes)
+    - Database (GeneratedQuestion table + QuestionCitation)
     
     Steps:
     1. Parse job request (document_id, class range, subject, difficulty, count)
     2. For each class in range:
        a. Retrieve relevant chunks
        b. Generate questions using LLM
-       c. Store questions in DB and Redis pools
+       c. Store questions in DB
     """
     job_data = json.loads(job.request_json)
     
@@ -42,8 +40,6 @@ def run_admin_generate_job(job) -> dict:
     question_count = job_data["question_count"]
     question_types = job_data.get("question_types", ["mcq", "short"])
     chapters = job_data.get("chapters")
-    syllabus = job_data.get("syllabus", "CBSE")
-    syllabus_version = job_data.get("syllabus_version", "2024")
     
     log.info(
         "admin_generate_job_started",
@@ -135,30 +131,24 @@ def run_admin_generate_job(job) -> dict:
                 )
                 return None
 
-            # Store questions in pool
-            question_ids = _store_questions_in_pool(
+            question_ids = _store_generated_questions(
                 questions=questions,
+                job_id=job.id,
                 corpus_id=corpus_id,
                 class_level=class_level,
                 subject=subject,
-                syllabus=syllabus,
-                syllabus_version=syllabus_version,
                 difficulty=difficulty,
+                chapter_fallback=chapters_to_use[0] if chapters_to_use else "Unknown Chapter",
             )
-
-            # Add to Redis
-            add_questions_to_pool(pool.id, question_ids)
 
             log.info(
                 "admin_questions_generated_for_class",
                 job_id=job.id,
                 class_level=class_level,
                 question_count=len(question_ids),
-                pool_id=pool.id,
             )
 
             return {
-                "pool_id": pool.id,
                 "class_level": class_level,
                 "question_count": len(question_ids),
             }
@@ -192,7 +182,7 @@ def run_admin_generate_job(job) -> dict:
     result = {
         "ok": True,
         "total_questions_generated": total_questions_generated,
-        "pools_updated": pools_updated,
+        "classes_updated": pools_updated,
         "document_id": document_id,
         "from_class": from_class,
         "to_class": to_class,
@@ -204,7 +194,7 @@ def run_admin_generate_job(job) -> dict:
         "admin_generate_job_completed",
         job_id=job.id,
         total_questions=total_questions_generated,
-        pools_count=len(pools_updated),
+        classes_count=len(pools_updated),
     )
     
     return result
@@ -225,133 +215,213 @@ def _generate_questions_for_class(
     Reuses the same logic as sync generation but stores results differently.
     """
     settings = get_settings()
-    
-    # Build blueprint
-    difficulty_mix = DifficultyMix(**{difficulty: count, "easy": 0, "medium": 0, "hard": 0})
-    
-    blueprint = Blueprint(
-        blueprint_version="2026-01-02",
-        job_summary={
-            "skills": ["problem-solving", "conceptual understanding"],
-            "role": "student assessment",
-            "focus_topics": [subject.lower()],
-        },
-        constraints=QuestionConstraints(
-            class_level=class_level,
-            subject=subject,
-            chapters=chapters,
-            language="en",
+
+    # Split total count across chapters (per-chapter generation).
+    chapters = [c for c in chapters if c and str(c).strip()]
+    if not chapters:
+        chapters = ["Unknown Chapter"]
+
+    base = max(0, count // len(chapters)) if chapters else 0
+    remainder = count - (base * len(chapters))
+    chapter_counts: dict[str, int] = {}
+    for idx, chapter in enumerate(chapters):
+        extra = 1 if idx < remainder else 0
+        chapter_counts[chapter] = base + extra
+
+    def _generate_for_chapter(chapter: str, chapter_count: int) -> list[dict]:
+        if chapter_count <= 0:
+            return []
+
+        difficulty_mix = DifficultyMix(**{difficulty: chapter_count, "easy": 0, "medium": 0, "hard": 0})
+        blueprint = Blueprint(
+            blueprint_version="2026-01-02",
+            job_summary={
+                "skills": ["problem-solving", "conceptual understanding"],
+                "role": "student assessment",
+                "focus_topics": [subject.lower()],
+            },
+            constraints=QuestionConstraints(
+                class_level=class_level,
+                subject=subject,
+                chapters=[chapter],
+                language="en",
+            ),
+            question_types=question_types,
+            count=chapter_count,
+            difficulty_mix=difficulty_mix,
+            coverage_strategy="balanced",
+        )
+
+        from app.api.v1.schemas.generation import GenerateRequest
+
+        generate_req = GenerateRequest(
+            tenant_id="admin",
+            corpus_id=corpus_id,
+            blueprint=blueprint,
+            max_context_chunks=settings.max_context_chunks,
+        )
+
+        response = generate_questions_sync(generate_req)
+        if not response.questions:
+            return []
+
+        questions = []
+        for q in response.questions:
+            q_dict = {
+                "stem": q.stem,
+                "qtype": q.qtype,
+                "difficulty": q.difficulty,
+                "language": q.language,
+                "options": q.options or [],
+                "answer": q.answer or "",
+                "explanation": q.explanation or "",
+                "tags": q.tags or {},
+                "citations": [c.model_dump() for c in q.citations],
+            }
+            questions.append(q_dict)
+        return questions
+
+    questions_all: list[dict] = []
+    chapter_workers = max(
+        1,
+        min(
+            int(getattr(settings, "admin_generate_chapter_concurrency", 1) or 1),
+            len(chapters),
         ),
-        question_types=question_types,
-        count=count,
-        difficulty_mix=difficulty_mix,
-        coverage_strategy="balanced",
     )
-    
-    # Use existing sync generation logic
-    from app.api.v1.schemas.generation import GenerateRequest
-    
-    generate_req = GenerateRequest(
-        tenant_id="admin",
-        corpus_id=corpus_id,
-        blueprint=blueprint,
-        max_context_chunks=settings.max_context_chunks,
-    )
-    
-    # Generate questions synchronously (this is in worker, so it's OK)
-    response = generate_questions_sync(generate_req)
-    
-    if not response.questions:
-        return []
-    
-    # Convert to dict format for storage
-    questions = []
-    for q in response.questions:
-        q_dict = {
-            "stem": q.stem,
-            "qtype": q.qtype,
-            "difficulty": q.difficulty,
-            "language": q.language,
-            "options": q.options or [],
-            "answer": q.answer or "",
-            "explanation": q.explanation or "",
-            "tags": q.tags or {},
-            "citations": [c.model_dump() for c in q.citations],
-        }
-        questions.append(q_dict)
-    
-    return questions
+
+    if chapter_workers == 1 or len(chapters) == 1:
+        for chapter, chapter_count in chapter_counts.items():
+            try:
+                questions_all.extend(_generate_for_chapter(chapter, chapter_count))
+            except Exception as e:  # noqa: BLE001
+                log.exception(
+                    "admin_generate_failed_for_chapter",
+                    class_level=class_level,
+                    chapter=chapter,
+                    error=str(e),
+                )
+    else:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=chapter_workers) as executor:
+            futures = {
+                executor.submit(_generate_for_chapter, chapter, chapter_count): chapter
+                for chapter, chapter_count in chapter_counts.items()
+            }
+            for future in concurrent.futures.as_completed(futures.keys()):
+                chapter = futures[future]
+                try:
+                    questions_all.extend(future.result())
+                except Exception as e:  # noqa: BLE001
+                    log.exception(
+                        "admin_generate_failed_for_chapter",
+                        class_level=class_level,
+                        chapter=chapter,
+                        error=str(e),
+                    )
+
+    return questions_all
 
 
-def _store_questions_in_pool(
+def _store_generated_questions(
     questions: list[dict],
+    job_id: str,
     corpus_id: str,
     class_level: int,
     subject: str,
-    syllabus: str,
-    syllabus_version: str,
     difficulty: str,
+    chapter_fallback: str,
 ) -> list[str]:
-    """Store questions in chapter pools and return question IDs."""
+    """Store questions in GeneratedQuestion + QuestionCitation tables."""
     question_ids: list[str] = []
 
-    chunk_ids: set[str] = set()
-    for q in questions:
-        for cit in q.get("citations", []) or []:
-            cid = cit.get("chunk_id")
-            if cid:
-                chunk_ids.add(str(cid))
+    def _parse_chapter_identity(chapter_value: str | None, fallback_chapter: str | None) -> tuple[int | None, str | None]:
+        raw = str(chapter_value or "").strip()
+        fallback = str(fallback_chapter or "").strip()
+        source = raw or fallback
+        if not source:
+            return None, None
+        if source.isdigit():
+            parsed_number = int(source)
+            if fallback and not fallback.isdigit():
+                fb_num, fb_name = _parse_chapter_identity(fallback, None)
+                if fb_num == parsed_number and fb_name:
+                    return parsed_number, fb_name
+            return parsed_number, None
 
-    chunk_chapters: dict[str, str] = {}
-    if chunk_ids:
-        with get_session() as session:
-            rows = session.exec(
-                select(Chunk.id, Chunk.chapter).where(Chunk.id.in_(list(chunk_ids)))
-            ).all()
-        chunk_chapters = {
-            str(r[0]): (str(r[1]).strip() if r[1] else "Unknown Chapter")
-            for r in rows
-        }
+        match = re.match(r"^(?:chapter|unit|ch)\s*(\d+)\s*[:\-]\s*(.+)$", source, flags=re.IGNORECASE)
+        if match:
+            return int(match.group(1)), (match.group(2) or "").strip() or None
 
-    questions_by_chapter: dict[str, list[dict]] = {}
-    for q in questions:
-        chapter = (q.get("tags") or {}).get("chapter")
-        if not chapter:
-            cid = (q.get("citations") or [{}])[0].get("chunk_id")
-            chapter = chunk_chapters.get(str(cid), None)
-        chapter = str(chapter).strip() if chapter else "Unknown Chapter"
-        questions_by_chapter.setdefault(chapter, []).append(q)
+        match = re.match(r"^(?:chapter|unit|ch)\s*(\d+)\s*$", source, flags=re.IGNORECASE)
+        if match:
+            parsed_number = int(match.group(1))
+            if fallback and fallback != source:
+                fb_num, fb_name = _parse_chapter_identity(fallback, None)
+                if fb_num == parsed_number and fb_name:
+                    return parsed_number, fb_name
+            return parsed_number, None
 
+        return None, source
+
+    citation_chunk_ids = {
+        cit.get("chunk_id")
+        for q in questions
+        for cit in (q.get("citations") or [])
+        if cit.get("chunk_id")
+    }
     with get_session() as session:
-        for chapter, chapter_questions in questions_by_chapter.items():
-            pool = get_or_create_pool(syllabus, class_level, subject, chapter, difficulty, syllabus_version)
-            for q in chapter_questions:
-                q_id = str(uuid.uuid4())
-                question_ids.append(q_id)
+        valid_chunk_query = select(Chunk.id).where(
+            Chunk.corpus_id == corpus_id,
+            Chunk.id.in_(citation_chunk_ids),
+        ) if citation_chunk_ids else None
+        valid_chunk_ids = set(
+            session.exec(valid_chunk_query).all() if valid_chunk_query else []
+        )
 
-                # Extract fields
-                stem = q.get("stem", "")
-                options = q.get("options") or []
-                answer = q.get("answer")
-                citations = q.get("citations", [])
-                source_chunk_id = citations[0].get("chunk_id") if citations else None
-                tags = q.get("tags", {})
-                concept = tags.get("concept")
+        for q in questions:
+            q_data = dict(q)
+            tags = q_data.get("tags") or {}
+            if not tags.get("chapter"):
+                tags["chapter"] = chapter_fallback
+            q_data["tags"] = tags
+            chapter_value = str(tags.get("chapter") or chapter_fallback)
+            chapter_number, chapter_name = _parse_chapter_identity(chapter_value, chapter_fallback)
 
-                pool_question = PoolQuestion(
-                    id=q_id,
-                    pool_id=pool.id,
-                    question_text=stem,
-                    options=json.dumps(options),
-                    correct_answer=answer,
-                    concept=concept,
-                    difficulty=difficulty,
-                    source_chunk_id=source_chunk_id,
-                    question_json=json.dumps(q),
+            dq = GeneratedQuestion(
+                job_id=job_id,
+                corpus_id=corpus_id,
+                class_level=class_level,
+                subject=subject,
+                chapter=chapter_value,
+                chapter_number=chapter_number,
+                chapter_name=chapter_name,
+                difficulty=difficulty,
+                qtype=str(q_data.get("qtype") or ""),
+                language=str(q_data.get("language") or "en"),
+                question_json=json.dumps(q_data),
+                dedupe_key=str(tags.get("dedupe_key") or ""),
+            )
+            session.add(dq)
+            session.commit()
+            session.refresh(dq)
+            question_ids.append(dq.id)
+
+            for cit in q_data.get("citations") or []:
+                chunk_id = cit.get("chunk_id")
+                if chunk_id not in valid_chunk_ids:
+                    continue
+                session.add(
+                    QuestionCitation(
+                        question_id=dq.id,
+                        chunk_id=chunk_id,
+                        document_id=cit.get("document_id"),
+                        storage_uri=cit.get("storage_uri"),
+                        page_start=cit.get("page_start"),
+                        page_end=cit.get("page_end"),
+                        excerpt=cit.get("excerpt"),
+                    )
                 )
-                session.add(pool_question)
+            session.commit()
 
-        session.commit()
-
-    log.info("admin_questions_stored_in_pool", count=len(question_ids))
+    log.info("admin_questions_stored_generated", count=len(question_ids))
     return question_ids

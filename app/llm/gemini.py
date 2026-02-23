@@ -8,6 +8,7 @@ import httpx
 
 from app.llm.base import LLMResult
 from app.llm.stub import StubLLMClient
+from app.observability.agentbill import finalize_event, start_event
 
 
 def _repair_json(text: str) -> str:
@@ -181,9 +182,10 @@ class GeminiClient:
     Note: exact REST surface varies by Google SDK/version; we isolate it here to stay provider-agnostic.
     """
 
-    def __init__(self, *, api_key: str, model: str):
+    def __init__(self, *, api_key: str, model: str, timeout_s: float = 300.0):
         self.api_key = api_key
         self.model = model
+        self.timeout_s = timeout_s
 
     def generate_json(self, *, system_prompt: str, user_prompt: str, json_schema: dict[str, Any]) -> LLMResult:
         # This is intentionally conservative: we request JSON-only and validate downstream.
@@ -191,6 +193,12 @@ class GeminiClient:
         # Gemini model naming is a common integration pitfall (some projects use
         # gemini-1.5-pro vs gemini-1.5-pro-latest, etc.). If the configured model
         # 404s, we retry a small set of safe fallbacks.
+        event = start_event(
+            event_name="ai_completion",
+            provider="gemini",
+            model=self.model,
+            kind="completion",
+        )
         def _url(api_version: str, model: str) -> str:
             return f"https://generativelanguage.googleapis.com/{api_version}/models/{model}:generateContent"
 
@@ -215,7 +223,7 @@ class GeminiClient:
             "generationConfig": {
                 "temperature": 0.2,
                 "topP": 0.9,
-                "maxOutputTokens": 6144,  # Balanced: enough for questions, faster than 8192
+                "maxOutputTokens": 16384,
                 "responseMimeType": "application/json",
             },
         }
@@ -229,7 +237,7 @@ class GeminiClient:
             "generationConfig": {
                 "temperature": 0.2,
                 "topP": 0.9,
-                "maxOutputTokens": 6144,  # Balanced: enough for questions, faster than 8192
+                "maxOutputTokens": 16384,
             },
         }
         # If the model supports schema constraints, you can wire it here later;
@@ -242,7 +250,7 @@ class GeminiClient:
         error_details: list[dict[str, Any]] = []
         data: dict[str, Any] | None = None
         
-        with httpx.Client(timeout=60) as client:
+        with httpx.Client(timeout=self.timeout_s) as client:
             # Try both API surfaces; some projects succeed with v1 when v1beta fails
             for api_version in ["v1beta", "v1"]:
                 for model in models_to_try:
@@ -393,10 +401,20 @@ class GeminiClient:
                 # Fallback to stub - this should always succeed
                 try:
                     logger.info("Using stub LLM as fallback")
+                    finalize_event(
+                        event,
+                        success=False,
+                        error="gemini_fallback_stub",
+                    )
                     return StubLLMClient().generate_json(system_prompt=system_prompt, user_prompt=user_prompt, json_schema=json_schema)
                 except Exception as stub_error:
                     # If even stub fails, raise a clear error
                     logger.error(f"Stub LLM also failed: {stub_error}")
+                    finalize_event(
+                        event,
+                        success=False,
+                        error="gemini_stub_failed",
+                    )
                     raise RuntimeError(
                         f"LLM generation failed: {error_msg}. "
                         f"Stub fallback also failed: {stub_error}"
@@ -443,6 +461,11 @@ class GeminiClient:
                 "resp_text_preview": (last_resp_text or "")[:1000],
                 "data_keys": list(data.keys()) if data else [],
             }
+            finalize_event(
+                event,
+                success=False,
+                error="gemini_empty_response",
+            )
             raise RuntimeError(f"gemini_empty_response: No text content in response; upstream={upstream}")
 
         # Try to parse JSON, with repair attempts
@@ -474,8 +497,31 @@ class GeminiClient:
                 "resp_text_preview": (text or last_resp_text or "")[:1000],
             }
             error_msg = str(parse_error) if parse_error else "unknown_json_error"
+            finalize_event(
+                event,
+                success=False,
+                error="gemini_invalid_json",
+            )
             raise RuntimeError(f"gemini_invalid_json_output: {error_msg}; upstream={upstream}")
-        
+
+        usage = None
+        if isinstance(data, dict):
+            usage = data.get("usageMetadata") or data.get("usage")
+        input_tokens = None
+        output_tokens = None
+        total_tokens = None
+        if isinstance(usage, dict):
+            input_tokens = usage.get("promptTokenCount") or usage.get("prompt_tokens")
+            output_tokens = usage.get("candidatesTokenCount") or usage.get("completion_tokens")
+            total_tokens = usage.get("totalTokenCount") or usage.get("total_tokens")
+
+        finalize_event(
+            event,
+            success=True,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            total_tokens=total_tokens,
+        )
         return LLMResult(raw_text=text, parsed_json=parsed)
 
 

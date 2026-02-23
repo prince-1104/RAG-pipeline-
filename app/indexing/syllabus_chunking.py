@@ -5,11 +5,13 @@ import re
 from dataclasses import dataclass
 
 from app.indexing.chunker import count_tokens, hard_token_split
+from app.indexing import tokenizer
 from app.indexing.pdf_parse import PageText
 
 
 _CHAPTER_RE = re.compile(r"^\s*(chapter|unit)\s+(\d+)\s*[:.\-]?\s*(.+)$", re.IGNORECASE)
 _HEADING_RE = re.compile(r"^[A-Z][A-Z0-9 \-:,()]{6,}$")
+
 
 
 @dataclass
@@ -52,36 +54,45 @@ def syllabus_aware_chunk(
     class_level: int,
     subject: str,
     toc: list[dict] | None,
-    max_chars: int = 1800,
-    overlap_chars: int = 250,
-    max_tokens: int | None = None,
+    max_tokens: int = 384,
+    overlap_tokens: int = 64,
+    hard_cap_tokens: int = 500,
 ) -> list[ChunkOut]:
     """
     Syllabus-aware chunking:
     - Prefer TOC ranges for chapter boundaries when provided
     - Fall back to chapter heading detection heuristics
-    - Chunk *within* a chapter using paragraph-ish boundaries, not fixed tokens
+    - Chunk *within* a chapter using token windows with overlap
     """
+    if max_tokens <= 0:
+        raise ValueError("max_tokens must be > 0")
+    if overlap_tokens < 0:
+        raise ValueError("overlap_tokens must be >= 0")
+    max_tokens = min(int(max_tokens), 500)
+    overlap_tokens = int(overlap_tokens)
+    if overlap_tokens != 0:
+        overlap_tokens = max(50, min(overlap_tokens, 80))
+    overlap_tokens = min(overlap_tokens, max_tokens - 1) if max_tokens > 1 else 0
+    hard_cap_tokens = min(max(1, int(hard_cap_tokens)), 500)
+
     if toc:
         out = _chunk_by_toc(
             pages=pages,
             class_level=class_level,
             subject=subject,
             toc=toc,
-            max_chars=max_chars,
-            overlap_chars=overlap_chars,
+            max_tokens=max_tokens,
+            overlap_tokens=overlap_tokens,
         )
     else:
         out = _chunk_by_heading(
-        pages=pages,
-        class_level=class_level,
-        subject=subject,
-        max_chars=max_chars,
-        overlap_chars=overlap_chars,
-    )
-    if max_tokens:
-        return _cap_chunks_by_tokens(out, max_tokens=max_tokens)
-    return out
+            pages=pages,
+            class_level=class_level,
+            subject=subject,
+            max_tokens=max_tokens,
+            overlap_tokens=overlap_tokens,
+        )
+    return _cap_chunks_by_tokens(out, max_tokens=hard_cap_tokens)
 
 
 def _cap_chunks_by_tokens(chunks: list[ChunkOut], max_tokens: int) -> list[ChunkOut]:
@@ -111,19 +122,25 @@ def _cap_chunks_by_tokens(chunks: list[ChunkOut], max_tokens: int) -> list[Chunk
     return capped
 
 
-def _chunk_text(text: str, max_chars: int, overlap_chars: int) -> list[str]:
+def _chunk_text_tokens(text: str, max_tokens: int, overlap_tokens: int) -> list[str]:
     text = text.strip()
     if not text:
         return []
+    toks = tokenizer.encode(text)
+    if not toks:
+        return []
+    step = max_tokens - overlap_tokens if max_tokens > overlap_tokens else max_tokens
+    if step <= 0:
+        step = max_tokens
     parts: list[str] = []
-    start = 0
-    while start < len(text):
-        end = min(len(text), start + max_chars)
-        parts.append(text[start:end])
-        if end == len(text):
+    for start in range(0, len(toks), step):
+        window = toks[start : start + max_tokens]
+        if not window:
             break
-        start = max(0, end - overlap_chars)
-    return parts
+        parts.append(tokenizer.decode(window).strip())
+        if start + max_tokens >= len(toks):
+            break
+    return [p for p in parts if p]
 
 
 def _topics_from_text(text: str) -> list[str]:
@@ -141,8 +158,8 @@ def _chunk_by_toc(
     class_level: int,
     subject: str,
     toc: list[dict],
-    max_chars: int,
-    overlap_chars: int,
+    max_tokens: int,
+    overlap_tokens: int,
 ) -> list[ChunkOut]:
     out: list[ChunkOut] = []
     for entry in toc:
@@ -151,7 +168,9 @@ def _chunk_by_toc(
         p1 = int(entry.get("page_end") or p0)
         chapter_pages = [p for p in pages if p0 <= p.page_number <= p1]
         combined = "\n".join(p.text for p in chapter_pages).strip()
-        for piece in _chunk_text(combined, max_chars=max_chars, overlap_chars=overlap_chars):
+        for piece in _chunk_text_tokens(
+            combined, max_tokens=max_tokens, overlap_tokens=overlap_tokens
+        ):
             norm = _normalize_ws(piece)
             if len(norm) < 200:
                 continue
@@ -175,8 +194,8 @@ def _chunk_by_heading(
     pages: list[PageText],
     class_level: int,
     subject: str,
-    max_chars: int,
-    overlap_chars: int,
+    max_tokens: int,
+    overlap_tokens: int,
 ) -> list[ChunkOut]:
     out: list[ChunkOut] = []
     current_chapter = "Unknown Chapter"
@@ -190,7 +209,9 @@ def _chunk_by_heading(
         if not combined:
             buffer = []
             return
-        for piece in _chunk_text(combined, max_chars=max_chars, overlap_chars=overlap_chars):
+        for piece in _chunk_text_tokens(
+            combined, max_tokens=max_tokens, overlap_tokens=overlap_tokens
+        ):
             norm = _normalize_ws(piece)
             if len(norm) < 200:
                 continue

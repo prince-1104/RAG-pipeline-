@@ -6,6 +6,7 @@ from typing import Any
 import httpx
 
 from app.llm.base import LLMResult
+from app.observability.agentbill import finalize_event, start_event
 
 
 class OpenAIClient:
@@ -61,10 +62,21 @@ class OpenAIClient:
             "response_format": {"type": "json_object"},
         }
 
+        event = start_event(
+            event_name="ai_completion",
+            provider="openai",
+            model=self.model,
+            kind="completion",
+        )
         with httpx.Client(timeout=self.timeout_s) as client:
             resp = client.post(url, headers=headers, json=payload)
 
         if resp.status_code in (401, 403):
+            finalize_event(
+                event,
+                success=False,
+                error=f"openai_auth_{resp.status_code}",
+            )
             try:
                 error_data = resp.json()
                 error_msg = error_data.get("error", {}).get("message", resp.text[:200])
@@ -73,6 +85,11 @@ class OpenAIClient:
             raise RuntimeError(f"OpenAI API authentication failed: {error_msg}")
 
         if not resp.is_success:
+            finalize_event(
+                event,
+                success=False,
+                error=f"openai_http_{resp.status_code}",
+            )
             try:
                 error_data = resp.json()
                 error_msg = error_data.get("error", {}).get("message", resp.text[:200])
@@ -81,15 +98,47 @@ class OpenAIClient:
             raise RuntimeError(f"OpenAI API error (HTTP {resp.status_code}): {error_msg}")
 
         data = resp.json()
+        usage = data.get("usage") if isinstance(data, dict) else None
+        input_tokens = None
+        output_tokens = None
+        total_tokens = None
+        if isinstance(usage, dict):
+            input_tokens = usage.get("prompt_tokens")
+            output_tokens = usage.get("completion_tokens")
+            total_tokens = usage.get("total_tokens")
         try:
             text = data["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as e:
+            finalize_event(
+                event,
+                success=False,
+                error="openai_missing_content",
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                total_tokens=total_tokens,
+            )
             raise RuntimeError(f"OpenAI response missing content: {e}") from e
 
         try:
             parsed = json.loads(text)
         except json.JSONDecodeError as e:
+            finalize_event(
+                event,
+                success=False,
+                error="openai_invalid_json",
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                total_tokens=total_tokens,
+            )
             raise RuntimeError(f"OpenAI did not return valid JSON: {e}") from e
 
+        finalize_event(
+            event,
+            success=True,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            total_tokens=total_tokens,
+            attributes={"ai.response_id": data.get("id")},
+        )
         return LLMResult(raw_text=text, parsed_json=parsed)
 

@@ -25,10 +25,12 @@ class JobKind(str, enum.Enum):
 class JobStatus(str, enum.Enum):
     """Job status enum - values must match database enum exactly (lowercase)."""
     queued = "queued"
+    claimed = "claimed"
     running = "running"
-    succeeded = "succeeded"
-    failed = "failed"
-    cancelled = "cancelled"
+    completed = "completed"
+    completed_partial = "completed_partial"
+    failed_retryable = "failed_retryable"
+    failed_terminal = "failed_terminal"
     
     def __str__(self) -> str:
         """Ensure str() returns the enum value, not the member name."""
@@ -57,10 +59,17 @@ class Document(SQLModel, table=True):
 
     # REQUIRED metadata for question pool system
     syllabus: str = Field(index=True, default="CBSE")  # e.g., "CBSE"
+    board: str = Field(index=True, default="CBSE")
     class_level: int | None = Field(default=None, index=True)
     subject: str | None = Field(default=None, index=True)
     syllabus_version: str = Field(index=True, default="2024")  # e.g., "2024"
     chapter: str | None = Field(default=None, index=True)  # Optional but preferred
+    chapter_number: int | None = Field(default=None, index=True)
+    chapter_name: str | None = Field(default=None, index=True)
+    language: str = Field(index=True, default="en")
+    source_type: str = Field(index=True, default="pdf")
+    concepts_json: str | None = None
+    difficulty_hint: str | None = Field(default=None, index=True)
 
     # optional hints to help syllabus-aware chunking
     toc_json: str | None = None
@@ -74,9 +83,17 @@ class Chunk(SQLModel, table=True):
     document_id: str = Field(index=True, foreign_key="document.id")
 
     # syllabus-aware tags used for filtering BEFORE vector search
+    board: str = Field(index=True, default="CBSE")
     class_level: int = Field(index=True)
     subject: str = Field(index=True)
     chapter: str = Field(index=True)
+    chapter_number: int | None = Field(default=None, index=True)
+    chapter_name: str | None = Field(default=None, index=True)
+    syllabus_version: str | None = Field(default=None, index=True)
+    language: str = Field(index=True, default="en")
+    source_type: str = Field(index=True, default="pdf")
+    concepts_json: str | None = None
+    difficulty_hint: str | None = Field(default=None, index=True)
     topics_json: str | None = None
 
     page_start: int = Field(index=True)
@@ -95,6 +112,7 @@ class GenerationJob(SQLModel, table=True):
 
     tenant_id: str = Field(index=True)
     corpus_id: str | None = Field(default=None, index=True)
+    document_id: str | None = Field(default=None, index=True)
 
     # request + result payloads (JSON strings to keep schema evolution easy)
     request_json: str
@@ -102,10 +120,16 @@ class GenerationJob(SQLModel, table=True):
 
     error_code: str | None = None
     error_message: str | None = None
+    last_error: str | None = None
+
+    retry_count: int = Field(default=0)
+    next_retry_at: datetime | None = None
 
     created_at: datetime = Field(default_factory=datetime.utcnow)
     started_at: datetime | None = None
     finished_at: datetime | None = None
+    claimed_at: datetime | None = None
+    worker_id: str | None = None
 
 
 class GeneratedQuestion(SQLModel, table=True):
@@ -116,10 +140,13 @@ class GeneratedQuestion(SQLModel, table=True):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()), primary_key=True)
     job_id: str = Field(index=True, foreign_key="generationjob.id")
     corpus_id: str = Field(index=True, foreign_key="corpus.id")
+    document_id: str | None = Field(default=None, index=True, foreign_key="document.id")
 
     class_level: int = Field(index=True)
     subject: str = Field(index=True)
     chapter: str = Field(index=True)
+    chapter_number: int | None = Field(default=None, index=True)
+    chapter_name: str | None = Field(default=None, index=True)
     difficulty: str = Field(index=True)
     qtype: str = Field(index=True)
     language: str = Field(index=True, default="en")
@@ -161,9 +188,12 @@ class QuestionPool(SQLModel, table=True):
     
     # Pool identity (unique constraint)
     syllabus: str = Field(index=True)  # e.g., "CBSE"
+    board: str = Field(index=True, default="CBSE")
     class_level: int = Field(index=True)
     subject: str = Field(index=True)
     chapter: str = Field(index=True, default="Unknown Chapter")
+    chapter_number: int | None = Field(default=None, index=True)
+    chapter_name: str | None = Field(default=None, index=True)
     difficulty: str = Field(index=True)  # easy | medium | hard
     syllabus_version: str = Field(index=True, default="2024")  # e.g., "2024"
     
@@ -195,7 +225,7 @@ class PoolQuestion(SQLModel, table=True):
     
     # Full question JSON for compatibility
     question_json: str
-    
+
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
 
@@ -209,4 +239,27 @@ class JobQuestion(SQLModel, table=True):
     
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
+
+class PrewarmRun(SQLModel, table=True):
+    """Tracks one execution of global prewarm promotion."""
+
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()), primary_key=True)
+    status: str = Field(index=True, default="running")  # running | completed | failed
+    syllabus: str = Field(index=True, default="CBSE")
+    syllabus_version: str = Field(index=True, default="2024")
+    promoted_count: int = Field(default=0)
+    pools_created: int = Field(default=0)
+    metadata_json: str | None = None
+    error_message: str | None = None
+    started_at: datetime = Field(default_factory=datetime.utcnow)
+    finished_at: datetime | None = None
+
+
+class PrewarmRunQuestion(SQLModel, table=True):
+    """Deterministic mapping of promoted question ids for a prewarm run."""
+
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()), primary_key=True)
+    prewarm_id: str = Field(index=True, foreign_key="prewarmrun.id")
+    question_id: str = Field(index=True, foreign_key="poolquestion.id")
+    created_at: datetime = Field(default_factory=datetime.utcnow)
 

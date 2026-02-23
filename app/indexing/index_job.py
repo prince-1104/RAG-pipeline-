@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from typing import Callable
 
 from sqlmodel import select
 
@@ -20,12 +21,18 @@ def _update_job_progress(job_id: str, progress_data: dict) -> None:
             session.commit()
 
 
-def run_index_job(job: GenerationJob) -> None:
+def run_index_job(
+    job: GenerationJob,
+    *,
+    on_document_complete: Callable[[int, int, Document, int], None] | None = None,
+) -> None:
     """
     Index job:
     - Read PDFs from object store
     - Syllabus-aware chunking -> Chunk rows
     - Upsert chunk embeddings into Qdrant
+
+    on_document_complete: Optional callback(doc_idx, doc_total, document, chunks) after each document.
     """
     assert job.corpus_id is not None
     req = json.loads(job.request_json)
@@ -78,6 +85,9 @@ def run_index_job(job: GenerationJob) -> None:
             class_level=doc.class_level,
             subject=doc.subject,
         )
+
+        if on_document_complete:
+            on_document_complete(doc_idx + 1, len(docs), doc, produced_count)
 
     # Update progress: starting embedding
     _update_job_progress(job.id, {

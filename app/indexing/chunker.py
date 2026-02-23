@@ -18,18 +18,17 @@ from __future__ import annotations
 import re
 from typing import Any
 
-import tiktoken
-
-
-# Deterministic tokenizer used across the pipeline.
-_ENC = tiktoken.get_encoding("cl100k_base")
+from app.indexing import tokenizer
 
 
 def count_tokens(text: str) -> int:
-    """Return token count using cl100k_base (deterministic)."""
-    if not text:
-        return 0
-    return len(_ENC.encode(text))
+    """Return token count using shared tokenizer."""
+    return tokenizer.count_tokens(text)
+
+
+def truncate_to_tokens(text: str, max_tokens: int) -> str:
+    """Truncate text to at most max_tokens using shared tokenizer."""
+    return tokenizer.truncate_to_tokens(text, max_tokens)
 
 
 _PARA_SPLIT_RE = re.compile(r"\n\s*\n+")  # blank line(s) with optional whitespace
@@ -95,10 +94,10 @@ def _decode_last_tokens(text: str, n_tokens: int) -> str:
     """Decode the last N tokens of text (used for overlap)."""
     if n_tokens <= 0:
         return ""
-    toks = _ENC.encode(text)
+    toks = tokenizer.encode(text)
     if not toks:
         return ""
-    return _ENC.decode(toks[-n_tokens:]).strip()
+    return tokenizer.decode(toks[-n_tokens:]).strip()
 
 
 def _hard_token_split(text: str, max_tokens: int) -> list[str]:
@@ -110,12 +109,12 @@ def _hard_token_split(text: str, max_tokens: int) -> list[str]:
     t = text.strip()
     if not t:
         return []
-    toks = _ENC.encode(t)
+    toks = tokenizer.encode(t)
     if len(toks) <= max_tokens:
         return [t]
     out: list[str] = []
     for i in range(0, len(toks), max_tokens):
-        piece = _ENC.decode(toks[i : i + max_tokens]).strip()
+        piece = tokenizer.decode(toks[i : i + max_tokens]).strip()
         if piece:
             out.append(piece)
     return out
@@ -186,7 +185,7 @@ def _paragraph_to_units(paragraph: str, max_tokens: int) -> list[str]:
     return [u for u in units if u and count_tokens(u) <= max_tokens]
 
 
-def chunk_text(pages: list[dict], max_tokens: int = 500, overlap_tokens: int = 80) -> list[str]:
+def chunk_text(pages: list[dict], max_tokens: int = 384, overlap_tokens: int = 64) -> list[str]:
     """
     Chunk extracted text pages into token-bounded chunks (strings only).
 
@@ -198,7 +197,7 @@ def chunk_text(pages: list[dict], max_tokens: int = 500, overlap_tokens: int = 8
 
     Rules implemented:
     - Prefer paragraph boundaries (split on blank lines).
-    - Target chunk size is ~450–550 tokens; hard cap is enforced by max_tokens (clamped to 550).
+    - Target chunk size is ~350–400 tokens; hard cap is enforced by max_tokens (clamped to 500).
     - Overlap is applied using the LAST overlap_tokens tokens of the previous chunk to
       preserve continuity across chunk boundaries (helps embeddings later).
     - If a paragraph exceeds the cap, fall back to sentence splitting; only split mid-sentence
@@ -209,10 +208,10 @@ def chunk_text(pages: list[dict], max_tokens: int = 500, overlap_tokens: int = 8
     if not pages:
         return []
 
-    # Enforce the "hard max 550" requirement defensively.
+    # Enforce a conservative hard max defensively.
     if max_tokens <= 0:
         raise ValueError("max_tokens must be > 0")
-    max_tokens = min(int(max_tokens), 550)
+    max_tokens = min(int(max_tokens), 500)
 
     if overlap_tokens < 0:
         raise ValueError("overlap_tokens must be >= 0")
@@ -291,11 +290,11 @@ def chunk_text(pages: list[dict], max_tokens: int = 500, overlap_tokens: int = 8
                     # Reduce overlap to fit (deterministic).
                     if overlap_text:
                         # Compute exact allowed overlap again using token lists.
-                        prev_toks = _ENC.encode(chunks[-1])
+                        prev_toks = tokenizer.encode(chunks[-1])
                         overlap_toks = prev_toks[-overlap_n:] if overlap_n > 0 else []
                         # Drop tokens from the left of the overlap until it fits.
                         while overlap_toks:
-                            trial = f"{_ENC.decode(overlap_toks).strip()}\n\n{unit}".strip()
+                            trial = f"{tokenizer.decode(overlap_toks).strip()}\n\n{unit}".strip()
                             if count_tokens(trial) <= max_tokens:
                                 current_chunk = trial
                                 break

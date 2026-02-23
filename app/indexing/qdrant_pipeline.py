@@ -57,9 +57,16 @@ def _load_document_meta(document_id: str) -> dict | None:
             "corpus_id": document.corpus_id,
             "storage_uri": document.storage_uri,
             "toc_json": document.toc_json,
+            "board": document.board,
             "class_level": document.class_level,
             "subject": document.subject,
             "chapter": document.chapter,
+            "chapter_number": document.chapter_number,
+            "chapter_name": document.chapter_name,
+            "syllabus_version": document.syllabus_version,
+            "language": document.language,
+            "source_type": document.source_type,
+            "difficulty_hint": document.difficulty_hint,
         }
 
 
@@ -69,6 +76,13 @@ def _index_document_qdrant_core(document_meta: dict, pages: list) -> int:
     corpus_id = document_meta["corpus_id"]
     class_level = document_meta["class_level"]
     subject = document_meta["subject"]
+    board = str(document_meta.get("board") or "CBSE")
+    chapter_number = document_meta.get("chapter_number")
+    chapter_name = document_meta.get("chapter_name")
+    syllabus_version = document_meta.get("syllabus_version")
+    language = str(document_meta.get("language") or "en")
+    source_type = str(document_meta.get("source_type") or "pdf")
+    difficulty_hint = document_meta.get("difficulty_hint")
 
     if not class_level or not subject:
         log.warning(
@@ -84,9 +98,9 @@ def _index_document_qdrant_core(document_meta: dict, pages: list) -> int:
         class_level=int(class_level),
         subject=str(subject).strip(),
         toc=toc,
-        max_chars=max(200, int(settings.embedding_chunk_max_chars)),
-        overlap_chars=max(0, int(settings.embedding_chunk_overlap_chars)),
-        max_tokens=settings.embedding_max_tokens,
+        max_tokens=int(settings.embedding_chunk_tokens),
+        overlap_tokens=int(settings.embedding_chunk_overlap_tokens),
+        hard_cap_tokens=int(settings.embedding_hard_cap_tokens),
     )
     if not produced:
         return 0
@@ -117,9 +131,17 @@ def _index_document_qdrant_core(document_meta: dict, pages: list) -> int:
             chunk = Chunk(
                 corpus_id=corpus_id,
                 document_id=document_id,
+                board=board,
                 class_level=ch.class_level,
                 subject=ch.subject,
                 chapter=ch.chapter,
+                chapter_number=chapter_number,
+                chapter_name=chapter_name or ch.chapter,
+                syllabus_version=syllabus_version,
+                language=language,
+                source_type=source_type,
+                concepts_json=json.dumps(ch.topics) if ch.topics else None,
+                difficulty_hint=difficulty_hint,
                 topics_json=json.dumps(ch.topics) if ch.topics else None,
                 page_start=ch.page_start,
                 page_end=ch.page_end,

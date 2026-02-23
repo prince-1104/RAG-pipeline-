@@ -47,15 +47,21 @@ class Settings(BaseSettings):
     embedding_model: str = "text-embedding-ada-002"
     embedding_dim: int = 1536
     embedding_max_tokens: int = 512
-    embedding_batch_size: int = 2
-    embedding_chunk_max_chars: int = 1500
-    embedding_chunk_overlap_chars: int = 200
+    embedding_batch_size: int = 8
+    embedding_chunk_tokens: int = 384
+    embedding_chunk_overlap_tokens: int = 64
+    embedding_hard_cap_tokens: int = 500
     together_api_key: str | None = None
 
     llm_provider: str = "stub"
+    # Configurable primary/fallback when llm_provider is "chain"
+    llm_primary_provider: str = "openai"
+    llm_fallback_provider: str = "gemini"
+    llm_fallback_timeout_s: float = 12.0  # Short timeout for fallback; fail fast, don't block job
+
     gemini_api_key: str | None = None
     gemini_model: str = "gemini-2.5-flash"  # Updated to newer model; falls back to stub if unavailable
-    
+
     # OpenAI (direct) configuration
     openai_api_key: str | None = None
     openai_model: str = "gpt-4o-mini"
@@ -65,6 +71,11 @@ class Settings(BaseSettings):
     openrouter_api_key: str | None = None
     openrouter_model: str = "openai/gpt-4o-mini"  # Default: cost-effective OpenAI model via OpenRouter
     openrouter_base_url: str | None = None  # Optional: defaults to https://openrouter.ai/api/v1
+
+    # AgentBill usage tracking (OpenTelemetry collector)
+    agentbill_enabled: bool = True
+    agentbill_api_key: str | None = None
+    agentbill_endpoint: str = "https://api.agentbill.io/functions/v1/otel-collector"
 
     # Runtime RAG (Qdrant + LLM): env EMBEDDING_API_KEY, LLM_API_KEY, LLM_MODEL
     embedding_api_key: str | None = None  # OpenAI embeddings; same as indexing
@@ -77,9 +88,14 @@ class Settings(BaseSettings):
     min_retrieval_confidence: float = 0.55
 
     # LLM performance tuning
-    llm_timeout_s: float = 90.0
+    llm_timeout_s: float = 300.0
     llm_temperature: float = 0.2
-    llm_max_tokens: int = 4096
+    llm_max_tokens: int = 16384
+    # Generation safety valves / debugging toggles
+    generation_max_total_attempts: int = 48
+    generation_max_batches: int = 64
+    generation_debug_relaxed_validation: bool = False
+    generation_disable_guardrails: bool = False
 
     # Pool generation performance tuning
     pool_generation_max_concurrency: int = 6
@@ -96,12 +112,28 @@ class Settings(BaseSettings):
 
     # Admin generation performance tuning (per-class parallelism)
     admin_generate_max_concurrency: int = 2
+    admin_generate_chapter_concurrency: int = 1
 
     # Ingest performance tuning
     ingest_max_concurrency: int = 2
+    # Ingestion contract rollout:
+    # - false: warn only for missing canonical metadata
+    # - true: reject ingestion requests missing required metadata
+    ingest_enforce_strict_metadata: bool = False
+    ingest_warn_missing_metadata: bool = True
+    ingest_default_syllabus_version: str = "CBSE_2023"
+    ingest_default_language: str = "en"
+    ingest_default_source_type: str = "pdf"
 
     # Job recovery
     job_stale_timeout_s: int = 1800
+    job_max_retries: int = 3
+    job_retry_base_delay_s: int = 30
+    job_retry_max_delay_s: int = 900
+    job_questions_per_chunk: int = 2
+    worker_id: str | None = None
+    # Global retrieval rollout
+    global_retrieval_ignore_tenant: bool = True
 
     # Debug logging (file I/O can slow generation; keep off by default)
     debug_log_enabled: bool = False

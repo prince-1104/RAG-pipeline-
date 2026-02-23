@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Literal
 
 from pydantic import BaseModel, Field
@@ -60,7 +61,7 @@ class DocumentJobStatus(BaseModel):
     """Status of a single document's generation job."""
     document_id: str
     job_id: str | None = None
-    status: str = "queued"  # queued, running, succeeded, failed
+    status: str = "queued"  # queued, claimed, running, completed, completed_partial, failed_retryable, failed_terminal
     message: str = ""
     error: str | None = None
 
@@ -84,3 +85,54 @@ class AdminReindexResponse(BaseModel):
     status: str = "queued"
     documents: int
     message: str = "Re-index job has been queued"
+
+
+class AdminPrewarmPoolsResponse(BaseModel):
+    """Response for global pool prewarm."""
+    status: str = "success"
+    prewarm_id: str
+    job_id: str
+    questions_promoted: int
+    pools_created: int
+    promoted_question_ids: list[str] = Field(default_factory=list)
+
+
+class AdminPrewarmQuestionOut(BaseModel):
+    """Canonical promoted question payload for Niyukti persistence."""
+
+    question_id: str
+    board: str
+    class_level: int
+    subject: str
+    syllabus_version: str
+    chapter_number: int
+    difficulty: str
+    question_type: str
+    question_json: dict
+    source_document_id: str
+    rag_generation_job_id: str
+
+
+class AdminPrewarmQuestionsResponse(BaseModel):
+    """Promoted questions from a specific prewarm run."""
+
+    prewarm_id: str
+    questions: list[AdminPrewarmQuestionOut]
+
+
+class AdminGeneratedQuestionOut(BaseModel):
+    id: str
+    class_level: int
+    subject: str
+    chapter: str
+    chapter_number: int | None = None
+    chapter_name: str | None = None
+    difficulty: str
+    qtype: str
+    language: str
+    question_json: dict
+    created_at: datetime
+
+
+class AdminGeneratedQuestionsResponse(BaseModel):
+    questions: list[AdminGeneratedQuestionOut] = Field(default_factory=list)

@@ -8,24 +8,94 @@ from sqlmodel import select
 from app.api.v1.schemas.admin import (
     AdminBatchGenerateQuestionsRequest,
     AdminBatchGenerateQuestionsResponse,
+    AdminGeneratedQuestionOut,
+    AdminGeneratedQuestionsResponse,
     AdminGenerateQuestionsRequest,
     AdminGenerateQuestionsResponse,
+    AdminPrewarmQuestionsResponse,
+    AdminPrewarmPoolsResponse,
     AdminReindexRequest,
     AdminReindexResponse,
     DocumentJobStatus,
 )
-from app.db.models import Corpus, Document, GenerationJob, JobKind, JobStatus
+from app.db.models import Corpus, Document, GeneratedQuestion, GenerationJob, JobKind, JobStatus
 from app.db.session import get_session
 from app.observability.logging import log
+from app.pools.service import (
+    fail_prewarm_run,
+    finish_prewarm_run,
+    get_prewarm_promoted_questions,
+    invalidate_pools_for_syllabus,
+    promote_all_generated_questions_to_pools,
+    start_prewarm_run,
+)
 
 
 router = APIRouter()
 
 
+@router.get("/generated-questions", response_model=AdminGeneratedQuestionsResponse)
+def admin_get_generated_questions(
+    generation_job_id: str | None = None,
+    document_id: str | None = None,
+    class_level: int | None = None,
+    subject: str | None = None,
+    chapter: str | None = None,
+    difficulty: str | None = None,
+    qtype: str | None = None,
+    language: str | None = None,
+):
+    with get_session() as session:
+        stmt = select(GeneratedQuestion)
+        if generation_job_id:
+            stmt = stmt.where(GeneratedQuestion.job_id == generation_job_id)
+        if document_id:
+            stmt = stmt.where(GeneratedQuestion.document_id == document_id)
+        if class_level is not None:
+            stmt = stmt.where(GeneratedQuestion.class_level == class_level)
+        if subject:
+            stmt = stmt.where(GeneratedQuestion.subject == subject)
+        if chapter:
+            stmt = stmt.where(GeneratedQuestion.chapter == chapter)
+        if difficulty:
+            stmt = stmt.where(GeneratedQuestion.difficulty == difficulty)
+        if qtype:
+            stmt = stmt.where(GeneratedQuestion.qtype == qtype)
+        if language:
+            stmt = stmt.where(GeneratedQuestion.language == language)
+
+        rows = session.exec(
+            stmt.order_by(GeneratedQuestion.created_at, GeneratedQuestion.id)
+        ).all()
+
+    questions: list[AdminGeneratedQuestionOut] = []
+    for row in rows:
+        try:
+            question_payload = json.loads(row.question_json) if row.question_json else {}
+        except (TypeError, json.JSONDecodeError):
+            question_payload = {}
+        questions.append(
+            AdminGeneratedQuestionOut(
+                id=str(row.id),
+                class_level=int(row.class_level),
+                subject=str(row.subject),
+                chapter=str(row.chapter),
+                chapter_number=row.chapter_number,
+                chapter_name=row.chapter_name,
+                difficulty=str(row.difficulty),
+                qtype=str(row.qtype),
+                language=str(row.language),
+                question_json=question_payload if isinstance(question_payload, dict) else {},
+                created_at=row.created_at,
+            )
+        )
+    return AdminGeneratedQuestionsResponse(questions=questions)
+
+
 @router.post("/generate-questions", response_model=AdminGenerateQuestionsResponse)
 def admin_generate_questions(request: Request, req: AdminGenerateQuestionsRequest):
     """
-    Admin endpoint to trigger question generation for uploaded PDFs.
+    Admin endpoint to enqueue pool-generation intent for uploaded PDFs.
     
     This is the ONLY place where LLM calls are allowed for question generation.
     - PDF upload must NEVER trigger LLM
@@ -41,9 +111,7 @@ def admin_generate_questions(request: Request, req: AdminGenerateQuestionsReques
     - Question types (mcq, short, long)
     - Optional chapters filter
     
-    Questions will be generated asynchronously and stored in:
-    - Database (PoolQuestion table)
-    - Redis (for fast retrieval by institutes)
+    The intent is stored and expanded into pool-generation jobs by the worker.
     """
     # Get tenant_id from header (admin should be authenticated)
     tenant_id = request.headers.get("X-Tenant-ID", "niyukti-platform")
@@ -119,7 +187,7 @@ def admin_generate_questions(request: Request, req: AdminGenerateQuestionsReques
         return AdminGenerateQuestionsResponse(
             job_id=job.id,
             status="queued",
-            message=f"Question generation job queued for document {req.document_id}. Generating {req.question_count} {req.difficulty} questions for classes {req.from_class}-{req.to_class} in {req.subject}."
+            message=f"Question generation job queued for document {req.document_id}. Generating {req.question_count} {req.difficulty} questions for classes {req.from_class}-{req.to_class} in {req.subject}.",
         )
 
 
@@ -179,7 +247,7 @@ def admin_batch_generate_questions(request: Request, req: AdminBatchGenerateQues
                     document_statuses.append(DocumentJobStatus(
                         document_id=document_id,
                         job_id=None,
-                        status="failed",
+                        status="failed_terminal",
                         message=f"Document {document_id} not found",
                         error="document_not_found"
                     ))
@@ -191,7 +259,7 @@ def admin_batch_generate_questions(request: Request, req: AdminBatchGenerateQues
                     document_statuses.append(DocumentJobStatus(
                         document_id=document_id,
                         job_id=None,
-                        status="failed",
+                        status="failed_terminal",
                         message=f"Corpus not found for document {document_id}",
                         error="corpus_not_found"
                     ))
@@ -202,7 +270,7 @@ def admin_batch_generate_questions(request: Request, req: AdminBatchGenerateQues
                     document_statuses.append(DocumentJobStatus(
                         document_id=document_id,
                         job_id=None,
-                        status="failed",
+                        status="failed_terminal",
                         message=f"Tenant mismatch for document {document_id}",
                         error="tenant_mismatch"
                     ))
@@ -213,7 +281,7 @@ def admin_batch_generate_questions(request: Request, req: AdminBatchGenerateQues
                     document_statuses.append(DocumentJobStatus(
                         document_id=document_id,
                         job_id=None,
-                        status="failed",
+                        status="failed_terminal",
                         message=f"Document {document_id} missing required metadata (class_level and subject)",
                         error="missing_metadata"
                     ))
@@ -298,7 +366,7 @@ def admin_batch_generate_questions(request: Request, req: AdminBatchGenerateQues
                 document_statuses.append(DocumentJobStatus(
                     document_id=document_id,
                     job_id=None,
-                    status="failed",
+                    status="failed_terminal",
                     message=f"Error processing document {document_id}: {str(e)}",
                     error=str(e)[:200],  # Truncate error message
                 ))
@@ -309,6 +377,88 @@ def admin_batch_generate_questions(request: Request, req: AdminBatchGenerateQues
         documents=document_statuses,
         message=f"Batch processing complete. {jobs_created} job(s) created for {len([d for d in document_statuses if d.status == 'queued'])} document(s)."
     )
+
+
+@router.post("/promote-generated-to-pool")
+def admin_promote_generated_to_pool_deprecated():
+    """
+    Deprecated: per-document promotion is removed.
+    """
+    raise HTTPException(status_code=410, detail="deprecated_use_prewarm_pools")
+
+
+@router.post("/prewarm-pool")
+def admin_prewarm_pool_deprecated():
+    """
+    Deprecated: per-document promotion is removed.
+    """
+    raise HTTPException(status_code=410, detail="deprecated_use_prewarm_pools")
+
+
+@router.post("/prewarm-pools", response_model=AdminPrewarmPoolsResponse)
+def admin_prewarm_pools(request: Request):
+    """
+    GLOBAL pool prewarming endpoint.
+    PROMOTION ONLY – NO GENERATION.
+    """
+    # Global operation: no request body required.
+    syllabus = "CBSE"
+    syllabus_version = "2024"
+    run = start_prewarm_run(syllabus=syllabus, syllabus_version=syllabus_version)
+    try:
+        result = promote_all_generated_questions_to_pools(
+            syllabus=syllabus,
+            syllabus_version=syllabus_version,
+            prewarm_id=run.id,
+        )
+        promoted_count = int(result.get("questions_promoted") or 0)
+        pools_created = int(result.get("pools_created") or 0)
+        finish_prewarm_run(
+            prewarm_id=run.id,
+            promoted_count=promoted_count,
+            pools_created=pools_created,
+        )
+        promoted_question_ids = [str(qid) for qid in (result.get("promoted_question_ids") or [])]
+        return AdminPrewarmPoolsResponse(
+            status=str(result.get("status") or "success"),
+            prewarm_id=run.id,
+            job_id=run.id,
+            questions_promoted=promoted_count,
+            pools_created=pools_created,
+            promoted_question_ids=promoted_question_ids,
+        )
+    except Exception as e:
+        fail_prewarm_run(prewarm_id=run.id, error_message=str(e))
+        raise
+
+
+@router.get("/prewarm/{prewarm_id}/questions", response_model=AdminPrewarmQuestionsResponse)
+def admin_get_prewarm_questions(request: Request, prewarm_id: str):
+    questions = get_prewarm_promoted_questions(prewarm_id=prewarm_id)
+    if not questions:
+        # Distinguish empty run from not found is intentionally not exposed;
+        # caller should treat missing data as no promoted questions.
+        return AdminPrewarmQuestionsResponse(prewarm_id=prewarm_id, questions=[])
+    return AdminPrewarmQuestionsResponse(prewarm_id=prewarm_id, questions=questions)
+
+
+@router.post("/invalidate-pools")
+def admin_invalidate_pools(request: Request):
+    """
+    Internal-only pool invalidation for syllabus updates.
+    """
+    syllabus = request.headers.get("X-Syllabus", "CBSE")
+    syllabus_version = request.headers.get("X-Syllabus-Version", "2024")
+    result = invalidate_pools_for_syllabus(
+        syllabus=syllabus,
+        syllabus_version=syllabus_version,
+    )
+    return {
+        "status": "ok",
+        "syllabus": syllabus,
+        "syllabus_version": syllabus_version,
+        **result,
+    }
 
 
 @router.post("/reindex", response_model=AdminReindexResponse)

@@ -139,12 +139,34 @@ def create_app() -> FastAPI:
 
     @app.on_event("startup")
     def _startup() -> None:
-        init_db()
-        ensure_qdrant_payload_indexes()
+        try:
+            init_db()
+        except Exception as e:
+            log.warning(
+                "database_init_failed_during_startup",
+                error=str(e),
+                error_type=type(e).__name__,
+                message="Database initialization failed during startup. App will continue but database operations may fail."
+            )
+        
+        try:
+            ensure_qdrant_payload_indexes()
+        except Exception as e:
+            log.warning(
+                "qdrant_init_failed_during_startup",
+                error=str(e),
+                error_type=type(e).__name__,
+                message="Qdrant initialization failed during startup. App will continue but vector operations may fail."
+            )
+        
         log.info("startup_complete", env=settings.env, provider=settings.llm_provider)
 
     app.include_router(metrics_router, include_in_schema=False)
     app.include_router(v1_router, prefix="/v1")
+
+    # Health check endpoint at root level for easy access
+    from app.api.v1.routes.health import router as health_router
+    app.include_router(health_router, tags=["health"])
 
     # Runtime RAG API: POST /rag/generate/questions (Qdrant + LLM)
     from app.api.v1.routes.rag import router as rag_router

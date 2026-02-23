@@ -4,6 +4,8 @@ Run migrations to update schema when models change.
 """
 from __future__ import annotations
 
+import re
+
 from sqlalchemy import text
 from sqlmodel import Session
 
@@ -262,6 +264,118 @@ def migrate_add_question_pool_chapter() -> None:
             raise
 
 
+def _parse_generated_question_chapter(chapter: str | None) -> tuple[int | None, str | None]:
+    if not chapter:
+        return None, None
+    value = str(chapter).strip()
+    if not value:
+        return None, None
+    if value.isdigit():
+        return int(value), None
+
+    match = re.match(
+        r"^(?:chapter|unit|ch)\s*(\d+)\s*[:\-]\s*(.+)$",
+        value,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        return int(match.group(1)), (match.group(2) or "").strip() or None
+
+    match = re.match(r"^(?:chapter|unit|ch)\s*(\d+)\s*$", value, flags=re.IGNORECASE)
+    if match:
+        return int(match.group(1)), None
+
+    return None, value
+
+
+def migrate_add_generatedquestion_chapter_identity() -> None:
+    """
+    Add chapter_number and chapter_name columns to generatedquestion table if missing.
+    Also backfill best-effort values from existing chapter string.
+    Idempotent.
+    """
+    engine = get_engine()
+    with Session(engine) as session:
+        try:
+            result = session.exec(
+                text(
+                    """
+                    SELECT column_name
+                    FROM information_schema.columns
+                    WHERE table_name = 'generatedquestion'
+                    AND column_name IN ('chapter_number', 'chapter_name')
+                    """
+                )
+            ).all()
+            existing_columns = {row[0] for row in result}
+
+            if "chapter_number" not in existing_columns:
+                session.exec(text("ALTER TABLE generatedquestion ADD COLUMN chapter_number INTEGER"))
+                session.exec(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS ix_generatedquestion_chapter_number "
+                        "ON generatedquestion(chapter_number)"
+                    )
+                )
+                log.info("migration_column_added", table="generatedquestion", column="chapter_number")
+            else:
+                log.info("migration_column_exists", table="generatedquestion", column="chapter_number")
+
+            if "chapter_name" not in existing_columns:
+                session.exec(text("ALTER TABLE generatedquestion ADD COLUMN chapter_name VARCHAR"))
+                session.exec(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS ix_generatedquestion_chapter_name "
+                        "ON generatedquestion(chapter_name)"
+                    )
+                )
+                log.info("migration_column_added", table="generatedquestion", column="chapter_name")
+            else:
+                log.info("migration_column_exists", table="generatedquestion", column="chapter_name")
+
+            session.commit()
+
+            rows = session.exec(
+                text(
+                    """
+                    SELECT id, chapter, chapter_number, chapter_name
+                    FROM generatedquestion
+                    """
+                )
+            ).all()
+            for row in rows:
+                row_id = str(row[0])
+                chapter = row[1]
+                existing_number = row[2]
+                existing_name = row[3]
+                parsed_number, parsed_name = _parse_generated_question_chapter(chapter)
+                next_number = existing_number if existing_number is not None else parsed_number
+                next_name = existing_name if existing_name else parsed_name
+                if next_number == existing_number and next_name == existing_name:
+                    continue
+                session.execute(
+                    text(
+                        """
+                        UPDATE generatedquestion
+                        SET chapter_number = :chapter_number,
+                            chapter_name = :chapter_name
+                        WHERE id = :id
+                        """
+                    ),
+                    {
+                        "id": row_id,
+                        "chapter_number": next_number,
+                        "chapter_name": next_name,
+                    },
+                )
+            session.commit()
+            log.info("migration_complete", migration="add_generatedquestion_chapter_identity")
+        except Exception as e:
+            session.rollback()
+            log.exception("migration_error", error=str(e))
+            raise
+
+
 def run_all_migrations() -> None:
     """Run all pending migrations."""
     log.info("migrations_starting")
@@ -270,6 +384,7 @@ def run_all_migrations() -> None:
     migrate_add_question_pool_status_ready_partial()
     migrate_add_question_pool_bookkeeping_fields()
     migrate_add_question_pool_chapter()
+    migrate_add_generatedquestion_chapter_identity()
     log.info("migrations_complete")
 
 

@@ -17,7 +17,15 @@ class Envelope(BaseModel):
 
 class JobRef(BaseModel):
     job_id: str
-    status: Literal["QUEUED", "RUNNING", "SUCCEEDED", "FAILED", "CANCELLED"]
+    status: Literal[
+        "queued",
+        "claimed",
+        "running",
+        "completed",
+        "completed_partial",
+        "failed_retryable",
+        "failed_terminal",
+    ]
 
 
 class Citation(BaseModel):

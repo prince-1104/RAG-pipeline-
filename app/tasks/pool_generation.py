@@ -121,6 +121,8 @@ def _ensure_question_minimums(
         tags = {}
     tags.setdefault("concept", concept)
     tags.setdefault("chapter", chapter_fallback or (citation_chunk.chapter or "Unknown"))
+    if isinstance(q.get("qtype"), str) and q.get("qtype"):
+        tags.setdefault("question_type", str(q.get("qtype")))
     q["tags"] = tags
 
     # difficulty
@@ -241,6 +243,8 @@ def generate_question_pool(
             chapters=[chapter],
             query=query,
             top_k=top_k,
+            board=syllabus,
+            syllabus_version=syllabus_version,
         )
         
         if not rr.chunks or len(rr.chunks) < 3:
@@ -590,6 +594,7 @@ def _generate_questions_for_concept(
             
             if not rej:
                 q["tags"] = {**(q.get("tags") or {}), "chapter": chapter, "dedupe_key": dk, "concept": concept}
+                q["tags"]["question_type"] = qtype
                 valid_questions.append(q)
 
         log.info(

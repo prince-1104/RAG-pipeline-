@@ -72,8 +72,32 @@ def reject_if_embedding_duplicate(
     if not stems:
         return None
 
+    # Fast exact-stem check to avoid embedding duplicates
+    stem_norm = stem.strip().lower()
+    for s in stems:
+        if stem_norm and s.strip().lower() == stem_norm:
+            return GuardrailReject(
+                reason="DUPLICATE_QUESTION",
+                details={"match_type": "exact_stem"},
+            )
+
+    # Deduplicate stems list before embedding to avoid redundant vectors
+    seen = set()
+    unique_stems: list[str] = []
+    for s in stems:
+        key = s.strip().lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        unique_stems.append(s)
+    stems = unique_stems
+
     try:
-        embs = np.asarray(embed_texts([stem] + stems), dtype=np.float32)
+        # qdrant_index.embed_texts returns (idx, vector) tuples; unwrap to vectors
+        pairs = embed_texts([stem] + stems)
+        pairs = sorted(pairs, key=lambda x: x[0])
+        vecs = [v for _, v in pairs]
+        embs = np.asarray(vecs, dtype=np.float32)
     except Exception as exc:
         log.warning("guardrail_embedding_failed", error=str(exc))
         return None

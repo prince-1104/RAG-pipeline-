@@ -9,12 +9,7 @@ from app.api.v1.schemas.pools import PoolRequest, PoolResponse
 from app.db.models import Corpus, GenerationJob, JobKind, JobStatus, QuestionPoolStatus
 from app.db.session import get_session
 from app.observability.logging import log
-from app.pools.service import (
-    get_or_create_pool,
-    get_pool_status,
-    get_questions_from_difficulty_pool,
-    list_pool_chapters,
-)
+from app.pools.service import get_pool_status, get_questions_from_difficulty_pool, list_pool_chapters
 
 
 router = APIRouter()
@@ -58,10 +53,10 @@ def get_generation_result(request: Request, job_id: str):
         job = session.get(GenerationJob, job_id)
         if not job:
             raise HTTPException(status_code=404, detail="job_not_found")
-        if job.kind.value != "GENERATE":
+        if job.kind.value != "generate":
             raise HTTPException(status_code=400, detail="not_a_generation_job")
-        if job.status.value != "SUCCEEDED":
-            raise HTTPException(status_code=409, detail=f"job_not_succeeded:{job.status.value}")
+        if job.status not in (JobStatus.completed, JobStatus.completed_partial):
+            raise HTTPException(status_code=409, detail=f"job_not_complete:{job.status.value}")
         assert job.result_json is not None
         return GenerateResponse.model_validate(json.loads(job.result_json))
 
@@ -76,6 +71,10 @@ def serve_from_pool(request: Request, req: PoolRequest):
     - Returns immediately if pool is ready
     - Returns 202 if pool is not ready
     """
+    internal_request = str(request.headers.get("X-Internal-Request", "")).strip().lower() == "true"
+    if not internal_request:
+        raise HTTPException(status_code=403, detail="pool_serving_internal_only")
+
     # Validate corpus
     with get_session() as session:
         corpus = session.get(Corpus, req.corpus_id)
@@ -109,16 +108,6 @@ def serve_from_pool(request: Request, req: PoolRequest):
         count_remaining = count
 
         for chapter in chapters:
-            pool = get_or_create_pool(
-                syllabus=req.syllabus,
-                class_level=req.class_level,
-                subject=req.subject,
-                chapter=chapter,
-                difficulty=difficulty,
-                syllabus_version=req.syllabus_version,
-            )
-            pool_info_by_chapter[difficulty][chapter] = pool.id
-
             pool_status = get_pool_status(
                 syllabus=req.syllabus,
                 class_level=req.class_level,
@@ -127,6 +116,7 @@ def serve_from_pool(request: Request, req: PoolRequest):
                 difficulty=difficulty,
                 syllabus_version=req.syllabus_version,
             )
+            pool_info_by_chapter[difficulty][chapter] = str(pool_status.value if pool_status else "missing")
             pool_statuses.append(pool_status.value if pool_status else "pending")
 
         if any(status in (QuestionPoolStatus.ready.value, QuestionPoolStatus.ready_partial.value) for status in pool_statuses):

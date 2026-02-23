@@ -29,6 +29,14 @@ def healthz():
     if s.openrouter_api_key:
         openrouter_tail = s.openrouter_api_key[-4:]
     
+    # Include AgentBill status for diagnostics
+    agentbill_status = None
+    try:
+        from app.observability.agentbill import get_agentbill_status
+        agentbill_status = get_agentbill_status()
+    except Exception:
+        pass
+    
     return {
         "status": "ok",
         "service": s.service_name,
@@ -39,6 +47,7 @@ def healthz():
         "gemini_api_key_tail": gemini_tail,
         "openrouter_model": s.openrouter_model,
         "openrouter_api_key_tail": openrouter_tail,
+        "agentbill": agentbill_status,
         "health_file": __file__,
     }
 
