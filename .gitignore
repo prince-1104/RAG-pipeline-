@@ -70,3 +70,13 @@ desktop.ini
 *.backup
 *~
 
+# AgentBill pseudo / test scripts (generated for AgentBill testing, not part of app)
+/load_test_agentbill.py
+/send_correct_signals.py
+/fast_load_test.py
+/verify_signals.py
+/simple_load_test.py
+/test_agentbill_signals.py
+/diagnose_signals.py
+/ultra_fast_test.py
+
