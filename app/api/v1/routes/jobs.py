@@ -4,18 +4,18 @@ from fastapi import APIRouter, HTTPException, Request
 
 from app.api.v1.schemas.jobs import JobStatusResponse
 from app.db.models import GenerationJob, JobStatus
-from app.db.session import get_session
+from app.db.session import get_session_ctx
 
 
 router = APIRouter()
 
 
 @router.get("/{job_id}", response_model=JobStatusResponse)
-def get_job(request: Request, job_id: str):
+async def get_job(request: Request, job_id: str):
     import json
     
-    with get_session() as session:
-        job = session.get(GenerationJob, job_id)
+    async with get_session_ctx() as session:
+        job = await session.get(GenerationJob, job_id)
         if not job:
             raise HTTPException(status_code=404, detail="job_not_found")
         
@@ -27,13 +27,11 @@ def get_job(request: Request, job_id: str):
                 "retryable": job.status == JobStatus.failed_retryable,
             }
         
-        # Parse result_json as result/progress
         result = None
         if job.result_json:
             try:
                 result = json.loads(job.result_json)
             except (json.JSONDecodeError, TypeError):
-                # If invalid JSON, return as string
                 result = {"raw": job.result_json}
         
         return JobStatusResponse(
@@ -46,5 +44,3 @@ def get_job(request: Request, job_id: str):
             error=err,
             result=result,
         )
-
-

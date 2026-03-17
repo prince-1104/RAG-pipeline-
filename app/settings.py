@@ -57,15 +57,16 @@ class Settings(BaseSettings):
     # Configurable primary/fallback when llm_provider is "chain"
     llm_primary_provider: str = "openai"
     llm_fallback_provider: str = "gemini"
-    llm_fallback_timeout_s: float = 12.0  # Short timeout for fallback; fail fast, don't block job
+    llm_fallback_timeout_s: float = 60.0
 
     gemini_api_key: str | None = None
-    gemini_model: str = "gemini-2.5-flash"  # Updated to newer model; falls back to stub if unavailable
+    gemini_model: str = "gemini-2.0-flash"  # Use v1beta; fallbacks: gemini-1.5-flash, gemini-1.5-pro
 
     # OpenAI (direct) configuration
     openai_api_key: str | None = None
     openai_model: str = "gpt-4o-mini"
     openai_base_url: str | None = None  # Optional; defaults to https://api.openai.com/v1
+    openai_timeout_s: float = 90.0  # Request timeout for OpenAI API calls
 
     # OpenRouter configuration (unified API for multiple LLM providers)
     openrouter_api_key: str | None = None
@@ -128,12 +129,28 @@ class Settings(BaseSettings):
     # Job recovery
     job_stale_timeout_s: int = 1800
     job_max_retries: int = 3
+    generation_job_max_retries: int = 3
     job_retry_base_delay_s: int = 30
     job_retry_max_delay_s: int = 900
     job_questions_per_chunk: int = 2
     worker_id: str | None = None
     # Global retrieval rollout
     global_retrieval_ignore_tenant: bool = True
+
+    # Worker
+    worker_poll_interval_s: int = 2
+    generation_job_timeout_s: int = 600  # 10 min so generation jobs can complete (10–20 questions)
+    indexing_job_timeout_s: int = 600  # Align indexing timeout with generation for large documents
+
+    # Generation quality
+    generation_batch_size: int = 12
+    generation_max_chunks_per_question: int = 5
+    generation_max_retrieval_cap: int = 25
+    generation_partial_threshold: float = 0.8
+
+    # LLM timeouts (OpenAI primary gets openai_timeout_s; chain primary uses llm_primary_timeout_s)
+    llm_primary_timeout_s: int = 90  # Primary provider timeout before fallback
+    llm_request_timeout_s: int = 90
 
     # Debug logging (file I/O can slow generation; keep off by default)
     debug_log_enabled: bool = False

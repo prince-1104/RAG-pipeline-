@@ -1,20 +1,20 @@
 from __future__ import annotations
 
-import concurrent.futures
+import asyncio
 import json
 import re
 from typing import Literal
 
 from app.api.v1.schemas.generation import Blueprint, DifficultyMix, QuestionConstraints
 from app.db.models import Chunk, GeneratedQuestion, QuestionCitation
-from app.db.session import get_session
+from app.db.session import get_session_ctx
 from app.generation.sync import generate_questions_sync
 from app.observability.logging import log
 from app.settings import get_settings
-from sqlmodel import select
+from sqlalchemy import select
 
 
-def run_admin_generate_job(job) -> dict:
+async def run_admin_generate_job(job) -> dict:
     """
     Admin-triggered question generation job.
     
@@ -63,10 +63,10 @@ def run_admin_generate_job(job) -> dict:
         if tenant_fallback:
             from app.db.models import Corpus
 
-            with get_session() as session:
-                corpus = session.exec(
+            async with get_session_ctx() as session:
+                corpus = (await session.execute(
                     select(Corpus).where(Corpus.tenant_id == tenant_fallback).limit(1)
-                ).first()
+                )).scalars().first()
             if not corpus:
                 raise ValueError("corpus_not_found_for_tenant_fallback")
             corpus_id = corpus.id
@@ -74,9 +74,9 @@ def run_admin_generate_job(job) -> dict:
             raise ValueError("corpus_id_missing_and_no_tenant_fallback")
 
     # Get document to verify it exists
-    with get_session() as session:
+    async with get_session_ctx() as session:
         from app.db.models import Document
-        document = session.get(Document, document_id)
+        document = await session.get(Document, document_id)
         if not document:
             raise ValueError(f"Document {document_id} not found")
     
@@ -88,16 +88,16 @@ def run_admin_generate_job(job) -> dict:
     classes_in_range = to_class - from_class + 1
     questions_per_class = max(1, question_count // classes_in_range)
 
-    def _run_for_class(class_level: int) -> dict | None:
+    async def _run_for_class(class_level: int) -> dict | None:
         try:
             # Determine chapters to use
             chapters_to_use = chapters
             if not chapters_to_use:
                 # Auto-detect chapters from chunks
-                with get_session() as session:
+                async with get_session_ctx() as session:
                     from app.db.models import Chunk
 
-                    chunk_rows = session.exec(
+                    chunk_rows = (await session.execute(
                         select(Chunk.chapter)
                         .where(
                             Chunk.corpus_id == corpus_id,
@@ -105,14 +105,14 @@ def run_admin_generate_job(job) -> dict:
                             Chunk.subject == subject,
                         )
                         .distinct()
-                    ).all()
+                    )).scalars().all()
                     chapters_to_use = [str(c).strip() for c in chunk_rows if c and str(c).strip()]
 
             if not chapters_to_use:
                 chapters_to_use = ["Unknown Chapter"]
 
             # Generate questions for this class
-            questions = _generate_questions_for_class(
+            questions = await _generate_questions_for_class(
                 corpus_id=corpus_id,
                 document_id=document_id,
                 class_level=class_level,
@@ -131,7 +131,7 @@ def run_admin_generate_job(job) -> dict:
                 )
                 return None
 
-            question_ids = _store_generated_questions(
+            question_ids = await _store_generated_questions(
                 questions=questions,
                 job_id=job.id,
                 corpus_id=corpus_id,
@@ -170,14 +170,12 @@ def run_admin_generate_job(job) -> dict:
         max_workers=max_workers,
     )
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(_run_for_class, cl): cl for cl in class_levels}
-        for future in concurrent.futures.as_completed(futures.keys()):
-            res = future.result()
-            if not res:
-                continue
-            pools_updated.append(res)
-            total_questions_generated += int(res["question_count"])
+    results = await asyncio.gather(*[_run_for_class(cl) for cl in class_levels])
+    for res in results:
+        if not res:
+            continue
+        pools_updated.append(res)
+        total_questions_generated += int(res["question_count"])
     
     result = {
         "ok": True,
@@ -200,7 +198,7 @@ def run_admin_generate_job(job) -> dict:
     return result
 
 
-def _generate_questions_for_class(
+async def _generate_questions_for_class(
     corpus_id: str,
     document_id: str,
     class_level: int,
@@ -228,7 +226,7 @@ def _generate_questions_for_class(
         extra = 1 if idx < remainder else 0
         chapter_counts[chapter] = base + extra
 
-    def _generate_for_chapter(chapter: str, chapter_count: int) -> list[dict]:
+    async def _generate_for_chapter(chapter: str, chapter_count: int) -> list[dict]:
         if chapter_count <= 0:
             return []
 
@@ -261,7 +259,7 @@ def _generate_questions_for_class(
             max_context_chunks=settings.max_context_chunks,
         )
 
-        response = generate_questions_sync(generate_req)
+        response = await generate_questions_sync(generate_req)
         if not response.questions:
             return []
 
@@ -293,7 +291,7 @@ def _generate_questions_for_class(
     if chapter_workers == 1 or len(chapters) == 1:
         for chapter, chapter_count in chapter_counts.items():
             try:
-                questions_all.extend(_generate_for_chapter(chapter, chapter_count))
+                questions_all.extend(await _generate_for_chapter(chapter, chapter_count))
             except Exception as e:  # noqa: BLE001
                 log.exception(
                     "admin_generate_failed_for_chapter",
@@ -302,27 +300,26 @@ def _generate_questions_for_class(
                     error=str(e),
                 )
     else:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=chapter_workers) as executor:
-            futures = {
-                executor.submit(_generate_for_chapter, chapter, chapter_count): chapter
-                for chapter, chapter_count in chapter_counts.items()
-            }
-            for future in concurrent.futures.as_completed(futures.keys()):
-                chapter = futures[future]
-                try:
-                    questions_all.extend(future.result())
-                except Exception as e:  # noqa: BLE001
-                    log.exception(
-                        "admin_generate_failed_for_chapter",
-                        class_level=class_level,
-                        chapter=chapter,
-                        error=str(e),
-                    )
+        chapter_items = list(chapter_counts.items())
+        results = await asyncio.gather(
+            *[_generate_for_chapter(chapter, chapter_count) for chapter, chapter_count in chapter_items],
+            return_exceptions=True,
+        )
+        for (chapter, _), result in zip(chapter_items, results):
+            if isinstance(result, BaseException):
+                log.exception(
+                    "admin_generate_failed_for_chapter",
+                    class_level=class_level,
+                    chapter=chapter,
+                    error=str(result),
+                )
+            else:
+                questions_all.extend(result)
 
     return questions_all
 
 
-def _store_generated_questions(
+async def _store_generated_questions(
     questions: list[dict],
     job_id: str,
     corpus_id: str,
@@ -369,13 +366,13 @@ def _store_generated_questions(
         for cit in (q.get("citations") or [])
         if cit.get("chunk_id")
     }
-    with get_session() as session:
+    async with get_session_ctx() as session:
         valid_chunk_query = select(Chunk.id).where(
             Chunk.corpus_id == corpus_id,
             Chunk.id.in_(citation_chunk_ids),
         ) if citation_chunk_ids else None
         valid_chunk_ids = set(
-            session.exec(valid_chunk_query).all() if valid_chunk_query else []
+            (await session.execute(valid_chunk_query)).scalars().all() if valid_chunk_query else []
         )
 
         for q in questions:
@@ -402,8 +399,8 @@ def _store_generated_questions(
                 dedupe_key=str(tags.get("dedupe_key") or ""),
             )
             session.add(dq)
-            session.commit()
-            session.refresh(dq)
+            await session.commit()
+            await session.refresh(dq)
             question_ids.append(dq.id)
 
             for cit in q_data.get("citations") or []:
@@ -421,7 +418,7 @@ def _store_generated_questions(
                         excerpt=cit.get("excerpt"),
                     )
                 )
-            session.commit()
+            await session.commit()
 
     log.info("admin_questions_stored_generated", count=len(question_ids))
     return question_ids

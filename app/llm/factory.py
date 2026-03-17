@@ -75,15 +75,14 @@ def get_llm_client() -> LLMClient:
             api_key=s.openai_api_key,
             model=s.openai_model,
             base_url=s.openai_base_url,
-            timeout_s=s.llm_timeout_s,
+            timeout_s=s.openai_timeout_s,
             temperature=s.llm_temperature,
             max_tokens=s.llm_max_tokens,
         )
     if provider == "chain":
-        # Configurable primary/fallback from LLM_PRIMARY_PROVIDER / LLM_FALLBACK_PROVIDER
         primary_client, primary_name = _build_client(
             s.llm_primary_provider,
-            timeout_s=s.llm_timeout_s,
+            timeout_s=s.llm_primary_timeout_s,
         )
         secondary_client, secondary_name = _build_client(
             s.llm_fallback_provider,
@@ -111,7 +110,7 @@ def get_llm_client() -> LLMClient:
             api_key=s.openai_api_key,
             model=s.openai_model,
             base_url=s.openai_base_url,
-            timeout_s=s.llm_timeout_s,
+            timeout_s=s.openai_timeout_s,
             temperature=s.llm_temperature,
             max_tokens=s.llm_max_tokens,
         )
@@ -171,7 +170,7 @@ def get_llm_client() -> LLMClient:
                 api_key=s.openai_api_key,
                 model=s.openai_model,
                 base_url=s.openai_base_url,
-                timeout_s=s.llm_timeout_s,
+                timeout_s=s.openai_timeout_s,
                 temperature=s.llm_temperature,
                 max_tokens=s.llm_max_tokens,
             )

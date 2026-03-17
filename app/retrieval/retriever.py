@@ -6,10 +6,10 @@ from threading import Lock
 from dataclasses import dataclass
 
 from qdrant_client.models import FieldCondition, Filter, MatchValue
-from sqlmodel import select
+from sqlalchemy import select
 
 from app.db.models import Chunk, Corpus
-from app.db.session import get_session
+from app.db.session import get_session_ctx
 from app.indexing.qdrant_index import embed_texts, get_qdrant_client
 from app.observability.logging import log
 from app.settings import get_settings
@@ -32,7 +32,7 @@ class RetrievalResult:
     confidence: float
 
 
-def retrieve(
+async def retrieve(
     *,
     corpus_id: str,
     document_id: str | None = None,
@@ -58,8 +58,8 @@ def retrieve(
         len(chapters) == 1 and _normalize_chapter_name(chapters[0]) == "unknown chapter"
     )
     normalized_subject = _normalize_subject(subject)
-    with get_session() as session:
-        corpus = session.get(Corpus, corpus_id)
+    async with get_session_ctx() as session:
+        corpus = await session.get(Corpus, corpus_id)
     if not corpus:
         return RetrievalResult(query=query, chunks=[], confidence=0.0)
     must: list[FieldCondition] = [
@@ -160,8 +160,8 @@ def retrieve(
     if not chunk_ids:
         return RetrievalResult(query=query, chunks=[], confidence=0.0)
 
-    with get_session() as session:
-        chunks = session.exec(select(Chunk).where(Chunk.id.in_(chunk_ids))).all()
+    async with get_session_ctx() as session:
+        chunks = (await session.execute(select(Chunk).where(Chunk.id.in_(chunk_ids)))).scalars().all()
     chunk_by_id = {str(c.id): c for c in chunks}
 
     results: list[RetrievedChunk] = []

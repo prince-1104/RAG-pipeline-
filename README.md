@@ -22,7 +22,7 @@ OPENAI_MODEL=gpt-4o-mini
 
 # Gemini (optional fallback)
 GEMINI_API_KEY=your_gemini_api_key_here
-GEMINI_MODEL=gemini-2.5-flash
+GEMINI_MODEL=gemini-2.0-flash
 
 # Database
 DATABASE_URL=postgresql://user:password@host:port/database?sslmode=require
@@ -113,7 +113,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8080 --reload
 
 ### 6) Run worker (async indexing/generation jobs)
 ```bash
-python -m app.worker
+python -m app.worker --concurrency 2
 ```
 
 ### 7) Register a corpus and document

@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 from typing import Iterable
 
-from sqlmodel import select
+from sqlalchemy import select
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
     FieldCondition,
@@ -15,7 +15,7 @@ from qdrant_client.models import (
 )
 
 from app.db.models import Chunk, Corpus, Document
-from app.db.session import get_session
+from app.db.session import get_session_ctx
 from app.embeddings.factory import get_embedding_client
 from app.indexing.chunker import count_tokens, truncate_to_tokens
 from app.observability.logging import log
@@ -291,7 +291,7 @@ def upsert_chunks(
     return total
 
 
-def upsert_document_chunks(
+async def upsert_document_chunks(
     *, document_id: str, corpus: Corpus, document: Document
 ) -> int:
     settings = get_settings()
@@ -302,13 +302,13 @@ def upsert_document_chunks(
     total = 0
     last_id: str | None = None
 
-    with get_session() as session:
+    async with get_session_ctx() as session:
         while True:
             q = select(Chunk).where(Chunk.document_id == document_id)
             if last_id:
                 q = q.where(Chunk.id > last_id)
             q = q.order_by(Chunk.id).limit(batch_size)
-            batch_chunks = session.exec(q).all()
+            batch_chunks = (await session.execute(q)).scalars().all()
             if not batch_chunks:
                 break
             last_id = batch_chunks[-1].id

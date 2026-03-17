@@ -14,10 +14,9 @@ from app.api.v1.schemas.niyukti_compat import (
     NiyuktiQuestionResponse,
 )
 from app.db.models import Corpus, GeneratedQuestion, PoolQuestion, QuestionPool, QuestionPoolStatus
-from app.db.session import get_session
+from app.db.session import get_session_ctx
 from app.settings import get_settings
 
-# Import ingest functionality
 from app.api.v1.routes.ingest import ingest_pdf
 
 
@@ -25,19 +24,19 @@ router = APIRouter()
 
 
 @router.get("/test-simple")
-def test_simple():
+async def test_simple():
     """Simple test endpoint to verify routing works"""
     return {"status": "ok", "message": "Endpoint is working"}
 
 
 @router.post("/test-post")
-def test_post(request: Request):
+async def test_post(request: Request):
     """Test POST endpoint"""
     return {"status": "ok", "method": request.method, "path": str(request.url.path)}
 
 
 @router.get("/test-error-handling")
-def test_error_handling():
+async def test_error_handling():
     """Test endpoint to verify error handling works"""
     try:
         raise ValueError("Test error message")
@@ -76,7 +75,6 @@ async def ingest_pdf_niyukti(
     """
     from app.observability.logging import log
     
-    # Get tenant_id from header or use default
     tenant_id = request.headers.get("X-Tenant-ID", "niyukti-platform")
     
     log.info(
@@ -93,7 +91,6 @@ async def ingest_pdf_niyukti(
         path=str(request.url.path),
     )
     
-    # Delegate to the main ingest implementation with tenant_id
     return await ingest_pdf(
         file,
         doc_id,
@@ -143,22 +140,20 @@ async def ingest_pdf_niyukti_pdf(
 
 
 @router.get("/ingest/stats")
-def get_ingest_stats(request: Request):
+async def get_ingest_stats(request: Request):
     """
     Get ingestion statistics for Niyukti UI.
     Returns counts of PDFs uploaded, chunks created, and index job status.
     """
-    from sqlalchemy import func
-    from sqlmodel import select
+    from sqlalchemy import select
     from app.db.models import Document, Chunk, GenerationJob, JobKind, JobStatus
     
     tenant_id = request.headers.get("X-Tenant-ID", "niyukti-platform")
     
-    with get_session() as session:
-        # Find corpus for this tenant
-        corpus = session.exec(
+    async with get_session_ctx() as session:
+        corpus = (await session.execute(
             select(Corpus).where(Corpus.tenant_id == tenant_id).limit(1)
-        ).first()
+        )).scalars().first()
         
         if not corpus:
             return {
@@ -169,18 +164,15 @@ def get_ingest_stats(request: Request):
                 "last_index_job": None,
             }
         
-        # Count documents
-        pdf_count = session.exec(
+        pdf_count = (await session.execute(
             select(func.count(Document.id)).where(Document.corpus_id == corpus.id)
-        ).one() or 0
+        )).scalar_one() or 0
         
-        # Count chunks
-        chunk_count = session.exec(
+        chunk_count = (await session.execute(
             select(func.count(Chunk.id)).where(Chunk.corpus_id == corpus.id)
-        ).one() or 0
+        )).scalar_one() or 0
         
-        # Get last index job
-        last_index_job = session.exec(
+        last_index_job = (await session.execute(
             select(GenerationJob)
             .where(
                 GenerationJob.corpus_id == corpus.id,
@@ -188,7 +180,7 @@ def get_ingest_stats(request: Request):
             )
             .order_by(GenerationJob.created_at.desc())
             .limit(1)
-        ).first()
+        )).scalars().first()
         
         last_job_info = None
         if last_index_job:
@@ -230,15 +222,12 @@ def _map_subject_name(subject: str) -> str:
         "socialscience": "Social Science",
         "sst": "Social Science",
     }
-    # Try exact match first
     if subject in subject_mapping:
         return subject_mapping[subject]
-    # Try case-insensitive match
     subject_lower = subject.lower()
     for key, value in subject_mapping.items():
         if subject_lower == key.lower():
             return value
-    # Return capitalized version if no mapping found
     return subject.capitalize()
 
 
@@ -258,11 +247,10 @@ def _parse_chapter_number(value: str | int | None) -> int | None:
     return None
 
 
-def _convert_niyukti_to_blueprint(req: NiyuktiGenerateRequest, tenant_id: str, corpus_id: str) -> GenerateRequest:
+async def _convert_niyukti_to_blueprint(req: NiyuktiGenerateRequest, tenant_id: str, corpus_id: str) -> GenerateRequest:
     """Convert Niyukti's simple request format to our blueprint format"""
     settings = get_settings()
     
-    # Map subject name
     mapped_subject = _map_subject_name(req.subject)
     # #region agent log
     try:
@@ -275,15 +263,13 @@ def _convert_niyukti_to_blueprint(req: NiyuktiGenerateRequest, tenant_id: str, c
         pass
     # #endregion
 
-    # Best-effort: use all known chapters for this (corpus,class,subject) so
-    # retrieval doesn't fail when Niyukti doesn't pass chapter names.
     chapters: list[str] = ["Unknown Chapter"]
     try:
-        from sqlmodel import select
+        from sqlalchemy import select
         from app.db.models import Chunk
 
-        with get_session() as session:
-            rows = session.exec(
+        async with get_session_ctx() as session:
+            rows = (await session.execute(
                 select(Chunk.chapter)
                 .where(
                     Chunk.corpus_id == corpus_id,
@@ -291,7 +277,7 @@ def _convert_niyukti_to_blueprint(req: NiyuktiGenerateRequest, tenant_id: str, c
                     Chunk.subject == mapped_subject,
                 )
                 .distinct()
-            ).all()
+            )).scalars().all()
         chap = [str(r).strip() for r in rows if r and str(r).strip()]
         # #region agent log
         try:
@@ -303,7 +289,7 @@ def _convert_niyukti_to_blueprint(req: NiyuktiGenerateRequest, tenant_id: str, c
             pass
         # #endregion
         if chap:
-            chapters = chap[:200]  # keep it bounded
+            chapters = chap[:200]
     except Exception as e:
         # #region agent log
         try:
@@ -316,25 +302,20 @@ def _convert_niyukti_to_blueprint(req: NiyuktiGenerateRequest, tenant_id: str, c
         # #endregion
         chapters = ["Unknown Chapter"]
     
-    # Determine question types and counts
     question_types = []
     difficulty_mix = {"easy": 0, "medium": 0, "hard": 0}
     
-    # Check if per-difficulty counts are provided (from Niyukti UI)
     has_difficulty_counts = req.easy_count is not None or req.medium_count is not None or req.hard_count is not None
     
     if has_difficulty_counts:
-        # Use per-difficulty counts from UI
         easy_total = req.easy_count or 0
         medium_total = req.medium_count or 0
         hard_total = req.hard_count or 0
         total_count = easy_total + medium_total + hard_total
         
-        # Apply MCQ ratio to each difficulty level if provided
-        mcq_ratio = req.mcq_ratio if req.mcq_ratio is not None else 70.0  # Default 70% if not specified
-        mcq_ratio = max(0, min(100, mcq_ratio)) / 100.0  # Normalize to 0-1
+        mcq_ratio = req.mcq_ratio if req.mcq_ratio is not None else 70.0
+        mcq_ratio = max(0, min(100, mcq_ratio)) / 100.0
         
-        # Distribute each difficulty level by MCQ ratio
         for difficulty, count in [("easy", easy_total), ("medium", medium_total), ("hard", hard_total)]:
             if count > 0:
                 mcq_count_for_diff = int(count * mcq_ratio)
@@ -350,24 +331,19 @@ def _convert_niyukti_to_blueprint(req: NiyuktiGenerateRequest, tenant_id: str, c
                         question_types.append("short")
                     difficulty_mix[difficulty] += desc_count_for_diff
     else:
-        # Fallback to original logic: use mcq_count/descriptive_count
         total_count = req.mcq_count + req.descriptive_count
         
-        # If difficulty_level is specified, use it; otherwise distribute automatically
         if req.difficulty_level and req.difficulty_level.lower() in ["easy", "medium", "hard"]:
-            # Use specified difficulty level for all questions
             difficulty = req.difficulty_level.lower()
             if req.mcq_count > 0:
                 question_types.append("mcq")
                 difficulty_mix[difficulty] += req.mcq_count
             if req.descriptive_count > 0:
-                question_types.append("short")  # Map "descriptive" to "short"
+                question_types.append("short")
                 difficulty_mix[difficulty] += req.descriptive_count
         else:
-            # Auto-distribute difficulty (original logic)
             if req.mcq_count > 0:
                 question_types.append("mcq")
-                # Distribute MCQ difficulty: 40% easy, 40% medium, 20% hard
                 easy_mcq = max(1, int(req.mcq_count * 0.4))
                 medium_mcq = max(1, int(req.mcq_count * 0.4))
                 hard_mcq = req.mcq_count - easy_mcq - medium_mcq
@@ -376,8 +352,7 @@ def _convert_niyukti_to_blueprint(req: NiyuktiGenerateRequest, tenant_id: str, c
                 difficulty_mix["hard"] += max(0, hard_mcq)
             
             if req.descriptive_count > 0:
-                question_types.append("short")  # Map "descriptive" to "short"
-                # Distribute descriptive difficulty: 30% easy, 50% medium, 20% hard
+                question_types.append("short")
                 easy_desc = max(1, int(req.descriptive_count * 0.3))
                 medium_desc = max(1, int(req.descriptive_count * 0.5))
                 hard_desc = req.descriptive_count - easy_desc - medium_desc
@@ -385,13 +360,11 @@ def _convert_niyukti_to_blueprint(req: NiyuktiGenerateRequest, tenant_id: str, c
                 difficulty_mix["medium"] += medium_desc
                 difficulty_mix["hard"] += max(0, hard_desc)
     
-    # Ensure at least one question type
     if not question_types:
         question_types = ["mcq"]
         difficulty_mix = {"easy": 1, "medium": 0, "hard": 0}
         total_count = 1
     
-    # Build blueprint
     from app.api.v1.schemas.generation import Blueprint, DifficultyMix, QuestionConstraints
     
     blueprint = Blueprint(
@@ -428,11 +401,9 @@ def _convert_pool_questions_to_niyukti_format(
     niyukti_questions = []
     
     for q in questions:
-        # Map question type
         qtype = q.get("qtype", "mcq")
         question_type = "mcq" if qtype == "mcq" else "descriptive"
         
-        # Build question response
         niyukti_q = NiyuktiQuestionResponse(
             question_text=q.get("stem", ""),
             question_type=question_type,
@@ -460,7 +431,7 @@ def _convert_pool_questions_to_niyukti_format(
 
 
 @router.get("/pool/status", response_model=PoolStatusResponse)
-def get_pool_status_endpoint(
+async def get_pool_status_endpoint(
     request: Request,
     class_level: int,
     subject: str,
@@ -472,8 +443,7 @@ def get_pool_status_endpoint(
     Read-only pool status endpoint.
     Requires X-Corpus-ID; never triggers generation.
     """
-    from sqlalchemy import func
-    from sqlmodel import select
+    from sqlalchemy import select
 
     from app.cache.redis_client import get_redis_client
     from app.db.models import PoolQuestion, QuestionPool, QuestionPoolStatus
@@ -484,8 +454,8 @@ def get_pool_status_endpoint(
     if not corpus_id:
         raise HTTPException(status_code=400, detail="missing_corpus_id")
 
-    with get_session() as session:
-        corpus = session.get(Corpus, corpus_id)
+    async with get_session_ctx() as session:
+        corpus = await session.get(Corpus, corpus_id)
         if not corpus:
             raise HTTPException(status_code=404, detail="corpus_not_found")
         if tenant_id and corpus.tenant_id != tenant_id:
@@ -501,11 +471,11 @@ def get_pool_status_endpoint(
     mapped_subject = _map_subject_name(subject)
     redis_client = get_redis_client()
 
-    chapters = [chapter] if chapter else list_pool_chapters(corpus_id, class_level, mapped_subject)
+    chapters = [chapter] if chapter else await list_pool_chapters(corpus_id, class_level, mapped_subject)
     pools: dict[str, PoolDifficultyStatus] = {}
     statuses: list[str] = []
 
-    with get_session() as session:
+    async with get_session_ctx() as session:
         for difficulty in ["easy", "medium", "hard"]:
             status_bucket: list[str] = []
             count_total = 0
@@ -515,7 +485,7 @@ def get_pool_status_endpoint(
 
             for ch in chapters:
                 chapter_num = _parse_chapter_number(ch)
-                pool = session.exec(
+                pool = (await session.execute(
                     select(QuestionPool).where(
                         QuestionPool.syllabus == syllabus,
                         QuestionPool.class_level == class_level,
@@ -524,7 +494,7 @@ def get_pool_status_endpoint(
                         QuestionPool.syllabus_version == syllabus_version,
                         *([QuestionPool.chapter_number == chapter_num] if chapter_num is not None else [QuestionPool.chapter == ch]),
                     )
-                ).first()
+                )).scalars().first()
 
                 if not pool:
                     status_bucket.append("missing")
@@ -537,9 +507,9 @@ def get_pool_status_endpoint(
 
                 if redis_count == 0:
                     redis_count = int(
-                        session.exec(
+                        (await session.execute(
                             select(func.count(PoolQuestion.id)).where(PoolQuestion.pool_id == pool.id)
-                        ).one()
+                        )).scalar_one()
                         or 0
                     )
                 count_total += redis_count
@@ -600,10 +570,8 @@ def _convert_response_to_niyukti_format(
     niyukti_questions = []
     
     for q in response.questions or []:
-        # Map question type
         question_type = "mcq" if q.qtype == "mcq" else "descriptive"
         
-        # Build question response
         niyukti_q = NiyuktiQuestionResponse(
             question_text=q.stem,
             question_type=question_type,
@@ -613,21 +581,17 @@ def _convert_response_to_niyukti_format(
         )
         
         if question_type == "mcq":
-            # MCQ format
             niyukti_q.options = q.options or []
             niyukti_q.correct_answer = q.answer or ""
         else:
-            # Descriptive format
             niyukti_q.expected_answer_text = q.answer or ""
-            niyukti_q.correct_answer = q.answer or ""  # Also set correct_answer for compatibility
-            # Extract keywords from explanation (simple approach)
+            niyukti_q.correct_answer = q.answer or ""
             if q.explanation:
-                # Simple keyword extraction - split by common words
                 keywords = [
                     word.lower()
                     for word in q.explanation.split()
                     if len(word) > 4 and word.isalnum()
-                ][:5]  # Limit to 5 keywords
+                ][:5]
                 niyukti_q.expected_keywords = keywords
         
         niyukti_questions.append(niyukti_q)
@@ -636,11 +600,11 @@ def _convert_response_to_niyukti_format(
 
 
 @router.post("/generate-questions")
-def generate_questions_niyukti(request: Request, req: NiyuktiGenerateRequest):
-    return _generate_questions_niyukti_impl(request, req)
+async def generate_questions_niyukti(request: Request, req: NiyuktiGenerateRequest):
+    return await _generate_questions_niyukti_impl(request, req)
 
 
-def _generate_questions_niyukti_impl(request: Request, req: NiyuktiGenerateRequest):
+async def _generate_questions_niyukti_impl(request: Request, req: NiyuktiGenerateRequest):
     """
     Compatibility endpoint for Niyukti platform.
     Expected: POST /api/v1/generate-questions; Request: { class_level, subject, mcq_count, descriptive_count }; Response: { questions: [...] }
@@ -682,7 +646,6 @@ def _generate_questions_niyukti_impl(request: Request, req: NiyuktiGenerateReque
                 pass
         # #endregion
 
-        # Resolve corpus: X-Corpus-ID is optional; fallback to metadata lookup.
         tenant_id = request.headers.get("X-Tenant-ID", "niyukti-platform")
         corpus_id = request.headers.get("X-Corpus-ID")
 
@@ -713,10 +676,10 @@ def _generate_questions_niyukti_impl(request: Request, req: NiyuktiGenerateReque
             if not board_norm:
                 raise HTTPException(status_code=400, detail="missing_corpus_metadata")
 
-            from sqlmodel import select
+            from sqlalchemy import select
 
-            def _lookup_corpus_ids(tenant_value: str) -> list[str]:
-                with get_session() as session:
+            async def _lookup_corpus_ids(tenant_value: str) -> list[str]:
+                async with get_session_ctx() as session:
                     query = (
                         select(Corpus.id)
                         .join(GeneratedQuestion, GeneratedQuestion.corpus_id == Corpus.id)
@@ -728,11 +691,11 @@ def _generate_questions_niyukti_impl(request: Request, req: NiyuktiGenerateReque
                     )
                     if chapter_norm:
                         query = query.where(GeneratedQuestion.chapter == chapter_norm)
-                    return [str(cid) for cid in session.exec(query).all()]
+                    return [str(cid) for cid in (await session.execute(query)).scalars().all()]
 
-            rows = _lookup_corpus_ids(tenant_id)
+            rows = await _lookup_corpus_ids(tenant_id)
             if not rows and tenant_id != "niyukti-platform":
-                rows = _lookup_corpus_ids("niyukti-platform")
+                rows = await _lookup_corpus_ids("niyukti-platform")
 
             if not rows:
                 raise HTTPException(status_code=404, detail="no_corpus_found_for_metadata")
@@ -748,11 +711,10 @@ def _generate_questions_niyukti_impl(request: Request, req: NiyuktiGenerateReque
             )
             # #endregion
 
-        with get_session() as session:
-            corpus = session.get(Corpus, corpus_id)
+        async with get_session_ctx() as session:
+            corpus = await session.get(Corpus, corpus_id)
             if not corpus:
                 raise HTTPException(status_code=404, detail="corpus_not_found")
-            # Do NOT reject on tenant mismatch when X-Corpus-ID is provided
             if tenant_id and corpus.tenant_id != tenant_id:
                 log.warning(
                     "tenant_mismatch_ignored_for_corpus_id",
@@ -761,11 +723,9 @@ def _generate_questions_niyukti_impl(request: Request, req: NiyuktiGenerateReque
                     corpus_tenant_id=corpus.tenant_id,
                 )
         
-        # PRODUCTION FLOW: Redis → DB → Background Job (NO LLM on user request)
-        syllabus = "CBSE"  # Default syllabus, can be made configurable
-        syllabus_version = "2024"  # Default version
+        syllabus = "CBSE"
+        syllabus_version = "2024"
         
-        # Determine difficulty mix from request
         difficulty_mix = {}
         if req.easy_count is not None:
             difficulty_mix["easy"] = req.easy_count or 0
@@ -787,7 +747,6 @@ def _generate_questions_niyukti_impl(request: Request, req: NiyuktiGenerateReque
                 mcq_count = 1
                 descriptive_count = max(0, int(req.question_count) - 1)
         
-        # Fallback to auto-distribution if no difficulty counts provided
         if not difficulty_mix:
             total = mcq_count + descriptive_count
             if total > 0:
@@ -816,7 +775,6 @@ def _generate_questions_niyukti_impl(request: Request, req: NiyuktiGenerateReque
             corpus_id=corpus_id,
         )
 
-        # Optional incremental sync: only return questions with serial_no > header value.
         after_serial_raw = request.headers.get("X-After-Serial-No")
         after_serial: int | None = None
         if after_serial_raw is not None and str(after_serial_raw).strip():
@@ -825,7 +783,6 @@ def _generate_questions_niyukti_impl(request: Request, req: NiyuktiGenerateReque
             except ValueError:
                 pass
         
-        # DB-only serving: bypass Redis/pools for now.
         all_questions = []
         pool_info = {}
         pool_info_by_chapter: dict[str, dict[str, str]] = {}
@@ -841,10 +798,10 @@ def _generate_questions_niyukti_impl(request: Request, req: NiyuktiGenerateReque
             if count <= 0:
                 continue
             
-            from sqlmodel import select
+            from sqlalchemy import select
 
             count_remaining = count
-            with get_session() as session:
+            async with get_session_ctx() as session:
                 pool_query = (
                     select(PoolQuestion)
                     .join(QuestionPool, PoolQuestion.pool_id == QuestionPool.id)
@@ -862,7 +819,7 @@ def _generate_questions_niyukti_impl(request: Request, req: NiyuktiGenerateReque
                     else:
                         pool_query = pool_query.where(QuestionPool.chapter.in_(chapters))
                 pool_query = pool_query.order_by(PoolQuestion.serial_no.asc())
-                db_questions = session.exec(pool_query.limit(count_remaining)).all()
+                db_questions = (await session.execute(pool_query.limit(count_remaining))).scalars().all()
                 # #region agent log
                 _dbg(
                     "C",
@@ -899,7 +856,7 @@ def _generate_questions_niyukti_impl(request: Request, req: NiyuktiGenerateReque
                         legacy_query = legacy_query.where(GeneratedQuestion.serial_no > after_serial)
                     if chapters:
                         legacy_query = legacy_query.where(GeneratedQuestion.chapter.in_(chapters))
-                    rows = session.exec(legacy_query).all()
+                    rows = (await session.execute(legacy_query)).scalars().all()
                     # #region agent log
                     _dbg(
                         "D",
@@ -942,12 +899,11 @@ def _generate_questions_niyukti_impl(request: Request, req: NiyuktiGenerateReque
         
         total_requested = sum(max(0, int(v)) for v in difficulty_mix.values())
 
-        # Final fallback: serve from legacy GeneratedQuestion when pools are empty.
         if (not all_questions) or (needs_generation and len(all_questions) < total_requested):
-            from sqlmodel import select
+            from sqlalchemy import select
 
             fallback_questions: list[dict] = []
-            with get_session() as session:
+            async with get_session_ctx() as session:
                 for difficulty, count in difficulty_mix.items():
                     if count <= 0:
                         continue
@@ -964,7 +920,7 @@ def _generate_questions_niyukti_impl(request: Request, req: NiyuktiGenerateReque
                         stmt = stmt.where(GeneratedQuestion.serial_no > after_serial)
                     if req.chapter is not None and str(req.chapter).strip():
                         stmt = stmt.where(GeneratedQuestion.chapter == str(req.chapter).strip())
-                    rows = session.exec(stmt).all()
+                    rows = (await session.execute(stmt)).scalars().all()
                     for gq in rows:
                         try:
                             q_data = json.loads(gq.question_json)
@@ -982,9 +938,7 @@ def _generate_questions_niyukti_impl(request: Request, req: NiyuktiGenerateReque
         if total_requested > 0 and len(all_questions) >= total_requested:
             needs_generation = False
 
-        # Return response
         if all_questions and not needs_generation:
-            # Order by serial_no ASC for incremental sync; then slice to requested count.
             all_questions.sort(key=lambda q: q.get("serial_no", 0))
             to_return = all_questions[:total_requested] if total_requested > 0 else all_questions
             niyukti_response = _convert_pool_questions_to_niyukti_format(
@@ -1005,7 +959,6 @@ def _generate_questions_niyukti_impl(request: Request, req: NiyuktiGenerateReque
             # #endregion
             return niyukti_response
 
-        # Need to generate - return 202 Accepted
         from fastapi.responses import JSONResponse
         return JSONResponse(
             status_code=202,
@@ -1021,7 +974,6 @@ def _generate_questions_niyukti_impl(request: Request, req: NiyuktiGenerateReque
         )
 
     except HTTPException as http_exc:
-        # Re-raise HTTPExceptions as-is (they'll be caught by handler)
         raise http_exc
     except Exception as e:
         error_trace = traceback.format_exc()

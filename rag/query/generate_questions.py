@@ -449,7 +449,7 @@ def generate_questions(
         try:
             parsed = _call_gemini(
                 api_key=gemini_api_key,
-                model=getattr(settings, "gemini_model", "gemini-2.5-flash"),
+                model=getattr(settings, "gemini_model", "gemini-2.0-flash"),
             )
         except Exception as exc:  # noqa: BLE001
             errors.append(f"gemini_failed:{str(exc)[:200]}")

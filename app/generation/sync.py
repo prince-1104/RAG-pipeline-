@@ -1,19 +1,18 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import re
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from collections import Counter
 from difflib import SequenceMatcher
-from threading import Lock
 from uuid import uuid4
 
 from fastapi import HTTPException
-from sqlmodel import select
+from sqlalchemy import select
 
 from app.api.v1.schemas.generation import GenerateRequest, GenerateResponse, GeneratedQuestionOut
 from app.db.models import Chunk, Document
-from app.db.session import get_session
+from app.db.session import get_session_ctx
 from app.generation.guardrails import (
     GuardrailReject,
     dedupe_key_for,
@@ -30,8 +29,8 @@ from app.retrieval.retriever import _normalize_subject, retrieve
 from app.settings import get_settings
 
 
-GENERATION_BATCH_SIZE = 50  # Ask for full chapter quota in one LLM call; cuts calls ~70%
-GENERATION_BATCH_CONCURRENCY = 2
+GENERATION_BATCH_SIZE = None
+GENERATION_BATCH_CONCURRENCY = 4
 JOB_TEXT_SIMILARITY_THRESHOLD = 0.96
 
 
@@ -42,23 +41,26 @@ def _summarize_rejections(rejected: list[dict], *, limit: int = 8) -> dict[str, 
     return dict(counts.most_common(limit))
 
 
-def generate_questions_sync(req: GenerateRequest, *, document_id: str | None = None) -> GenerateResponse:
+async def generate_questions_sync(req: GenerateRequest, *, document_id: str | None = None) -> GenerateResponse:
     """
     Generate questions synchronously with retry logic for guardrail rejections.
     Attempts to generate enough questions to meet blueprint requirements.
     """
     s = get_settings()
+    batch_size = s.generation_batch_size
     relaxed_validation = bool(getattr(s, "generation_debug_relaxed_validation", False))
     disable_guardrails = bool(getattr(s, "generation_disable_guardrails", False)) or relaxed_validation
     max_total_attempts = max(1, int(getattr(s, "generation_max_total_attempts", 48)))
     max_batches = max(1, int(getattr(s, "generation_max_batches", 64)))
     attempt_budget = {"remaining": max_total_attempts}
-    attempt_budget_lock = Lock()
     bp = req.blueprint
     target_count = bp.count
-    top_k = min(req.max_context_chunks or s.max_context_chunks, 50)
+    top_k = min(
+        bp.count * s.generation_max_chunks_per_question,
+        s.generation_max_retrieval_cap,
+    )
 
-    doc_uri = _document_uri_map(req.corpus_id)
+    doc_uri = await _document_uri_map(req.corpus_id)
     system_prompt = build_system_prompt()
     client = get_llm_client()
     job_dedupe_state = _JobDedupeState()
@@ -76,37 +78,35 @@ def generate_questions_sync(req: GenerateRequest, *, document_id: str | None = N
     ) -> GuardrailReject | None:
         if not norm_stem:
             return None
-        with job_dedupe_state.lock:
-            if norm_stem in job_dedupe_state.seen_norm or norm_stem in job_dedupe_state.inflight_norm:
+        if norm_stem in job_dedupe_state.seen_norm or norm_stem in job_dedupe_state.inflight_norm:
+            return GuardrailReject(
+                reason="DUPLICATE_QUESTION",
+                details={"match_type": "job_text_exact"},
+            )
+        active = list(job_dedupe_state.seen_norm) + list(job_dedupe_state.inflight_norm)
+        for other in active:
+            if other and SequenceMatcher(None, norm_stem, other).ratio() >= similarity_threshold:
                 return GuardrailReject(
                     reason="DUPLICATE_QUESTION",
-                    details={"match_type": "job_text_exact"},
+                    details={"match_type": "job_text_similar", "threshold": similarity_threshold},
                 )
-            active = list(job_dedupe_state.seen_norm) + list(job_dedupe_state.inflight_norm)
-            for other in active:
-                if other and SequenceMatcher(None, norm_stem, other).ratio() >= similarity_threshold:
-                    return GuardrailReject(
-                        reason="DUPLICATE_QUESTION",
-                        details={"match_type": "job_text_similar", "threshold": similarity_threshold},
-                    )
-            if key in job_dedupe_state.seen_keys or key in job_dedupe_state.inflight_keys:
-                return GuardrailReject(
-                    reason="DUPLICATE_QUESTION",
-                    details={"match_type": "job_key"},
-                )
-            job_dedupe_state.inflight_norm.add(norm_stem)
-            job_dedupe_state.inflight_keys.add(key)
+        if key in job_dedupe_state.seen_keys or key in job_dedupe_state.inflight_keys:
+            return GuardrailReject(
+                reason="DUPLICATE_QUESTION",
+                details={"match_type": "job_key"},
+            )
+        job_dedupe_state.inflight_norm.add(norm_stem)
+        job_dedupe_state.inflight_keys.add(key)
         return None
 
     def _finalize_job_dedupe(*, norm_stem: str, key: str, accepted: bool) -> None:
         if not norm_stem:
             return
-        with job_dedupe_state.lock:
-            job_dedupe_state.inflight_norm.discard(norm_stem)
-            job_dedupe_state.inflight_keys.discard(key)
-            if accepted:
-                job_dedupe_state.seen_norm.add(norm_stem)
-                job_dedupe_state.seen_keys.add(key)
+        job_dedupe_state.inflight_norm.discard(norm_stem)
+        job_dedupe_state.inflight_keys.discard(key)
+        if accepted:
+            job_dedupe_state.seen_norm.add(norm_stem)
+            job_dedupe_state.seen_keys.add(key)
 
     def _build_batches(mix, batch_size: int) -> list[dict[str, int]]:
         remaining = {
@@ -128,17 +128,14 @@ def generate_questions_sync(req: GenerateRequest, *, document_id: str | None = N
             batches.append(batch)
         return batches
 
-    # --- Retrieval cache: retrieve once per chapter scope, reuse across batches/retries ---
     _retrieval_cache: dict[str, object] = {}
-    _retrieval_cache_lock = Lock()
 
-    def _retrieve_cached(bp_local: GenerateRequest):
+    async def _retrieve_cached(bp_local: GenerateRequest):
         """Retrieve chunks once per chapter key and cache the result."""
         chapters_key = "|".join(sorted(bp_local.blueprint.constraints.chapters))
         cache_key = f"{bp_local.corpus_id}:{bp_local.blueprint.constraints.class_level}:{bp_local.blueprint.constraints.subject}:{chapters_key}"
-        with _retrieval_cache_lock:
-            if cache_key in _retrieval_cache:
-                return _retrieval_cache[cache_key]
+        if cache_key in _retrieval_cache:
+            return _retrieval_cache[cache_key]
 
         query = _blueprint_to_query(bp_local.blueprint)
         chapter_number = bp_local.blueprint.constraints.chapter_number
@@ -146,27 +143,25 @@ def generate_questions_sync(req: GenerateRequest, *, document_id: str | None = N
             ch_only = str(bp_local.blueprint.constraints.chapters[0]).strip()
             if ch_only.isdigit():
                 chapter_number = int(ch_only)
-        rr = retrieve(
+        rr = await retrieve(
             corpus_id=bp_local.corpus_id,
             document_id=document_id,
             class_level=bp_local.blueprint.constraints.class_level,
             subject=bp_local.blueprint.constraints.subject,
             chapters=bp_local.blueprint.constraints.chapters,
             query=query,
-            top_k=max(top_k, 30),  # retrieve more chunks for richer context
+            top_k=max(top_k, 30),
             board=bp_local.blueprint.constraints.board,
             syllabus_version=bp_local.blueprint.constraints.syllabus_version,
             chapter_number=chapter_number,
         )
-        with _retrieval_cache_lock:
-            _retrieval_cache[cache_key] = rr
+        _retrieval_cache[cache_key] = rr
         return rr
 
-    def _generate_for_blueprint(
+    async def _generate_for_blueprint(
         bp_local: GenerateRequest,
     ) -> tuple[list[GeneratedQuestionOut], list[dict]]:
-        # Use cached retrieval — no redundant Qdrant queries on retries.
-        rr = _retrieve_cached(bp_local)
+        rr = await _retrieve_cached(bp_local)
         if not rr.chunks:
             return [], [{"reason": "INSUFFICIENT_CONTEXT", "details": {"code": "no_in_scope_chunks"}}]
         if rr.confidence < s.min_retrieval_confidence:
@@ -177,41 +172,47 @@ def generate_questions_sync(req: GenerateRequest, *, document_id: str | None = N
                 }
             ]
 
-        # Single LLM call — accept partial (>= MIN threshold) without retry.
         out_questions: list[GeneratedQuestionOut] = []
         rejected: list[dict] = []
 
-        with attempt_budget_lock:
-            if attempt_budget["remaining"] <= 0:
-                rejected.append(
-                    {
-                        "reason": "ATTEMPT_BUDGET_EXHAUSTED",
-                        "details": {
-                            "max_total_attempts": max_total_attempts,
-                            "scope": "generate_questions_sync",
-                        },
-                    }
-                )
-                log.warning(
-                    "generation_attempt_budget_exhausted",
-                    max_total_attempts=max_total_attempts,
-                    generated=0,
-                    rejected=len(rejected),
-                )
-                return out_questions, rejected
-            attempt_budget["remaining"] -= 1
-            attempt_num_global = max_total_attempts - attempt_budget["remaining"]
+        if attempt_budget["remaining"] <= 0:
+            rejected.append(
+                {
+                    "reason": "ATTEMPT_BUDGET_EXHAUSTED",
+                    "details": {
+                        "max_total_attempts": max_total_attempts,
+                        "scope": "generate_questions_sync",
+                    },
+                }
+            )
+            log.warning(
+                "generation_attempt_budget_exhausted",
+                max_total_attempts=max_total_attempts,
+                generated=0,
+                rejected=len(rejected),
+            )
+            return out_questions, rejected
+        attempt_budget["remaining"] -= 1
+        attempt_num_global = max_total_attempts - attempt_budget["remaining"]
 
         user_prompt = build_user_prompt(
             blueprint=bp_local.blueprint, retrieval=rr, document_uri_by_id=doc_uri
         )
 
         try:
-            result = client.generate_json(
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                json_schema=QUESTION_SET_SCHEMA,
-            )
+            if hasattr(client, "async_generate_json"):
+                result = await client.async_generate_json(
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    json_schema=QUESTION_SET_SCHEMA,
+                )
+            else:
+                result = await asyncio.to_thread(
+                    client.generate_json,
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    json_schema=QUESTION_SET_SCHEMA,
+                )
         except Exception as e:
             error_msg = str(e)[:500]
             log.error(
@@ -311,7 +312,7 @@ def generate_questions_sync(req: GenerateRequest, *, document_id: str | None = N
 
             c0 = (q.get("citations") or [{}])[0]
             if not disable_guardrails:
-                rej = reject_if_exact_duplicate(corpus_id=req.corpus_id, key=dk)
+                rej = await reject_if_exact_duplicate(corpus_id=req.corpus_id, key=dk)
                 if not rej:
                     rej = reject_if_low_support(
                         answer=q.get("answer"),
@@ -319,7 +320,7 @@ def generate_questions_sync(req: GenerateRequest, *, document_id: str | None = N
                         excerpt=str(c0.get("excerpt") or ""),
                     )
                 if not rej:
-                    rej = reject_if_embedding_duplicate(corpus_id=req.corpus_id, stem=stem)
+                    rej = await reject_if_embedding_duplicate(corpus_id=req.corpus_id, stem=stem)
             if rej:
                 _finalize_job_dedupe(norm_stem=norm_stem, key=dk, accepted=False)
                 attempt_rejected.append({"reason": rej.reason, "details": rej.details})
@@ -360,13 +361,13 @@ def generate_questions_sync(req: GenerateRequest, *, document_id: str | None = N
 
         return out_questions[: bp_local.blueprint.count], rejected
 
-    def _run_batches_for_request(
+    async def _run_batches_for_request(
         local_req: GenerateRequest,
     ) -> tuple[list[GeneratedQuestionOut], list[dict], Exception | None]:
         local_bp = local_req.blueprint
         local_target = local_bp.count
         batches = _build_batches(
-            local_bp.difficulty_mix, min(GENERATION_BATCH_SIZE, local_target)
+            local_bp.difficulty_mix, min(batch_size, local_target)
         )
         original_batch_count = len(batches)
         if original_batch_count > max_batches:
@@ -408,7 +409,7 @@ def generate_questions_sync(req: GenerateRequest, *, document_id: str | None = N
                 )
 
                 try:
-                    batch_questions, batch_rejected = _generate_for_blueprint(batch_req)
+                    batch_questions, batch_rejected = await _generate_for_blueprint(batch_req)
                     out.extend(batch_questions)
                     rejected.extend(batch_rejected)
                 except Exception as exc:  # noqa: BLE001
@@ -422,59 +423,49 @@ def generate_questions_sync(req: GenerateRequest, *, document_id: str | None = N
                     continue
             return out[:local_target], rejected, last_error
 
-        with ThreadPoolExecutor(max_workers=max_concurrency) as executor:
-            in_flight: dict = {}
-            batch_idx = 0
+        tasks = []
+        for idx, mix in enumerate(batches, start=1):
+            batch_count = sum(mix.values())
+            batch_bp = local_bp.model_copy(deep=True)
+            batch_bp.count = batch_count
+            batch_bp.difficulty_mix = type(local_bp.difficulty_mix)(**mix)
+            batch_req = local_req.model_copy(deep=True)
+            batch_req.blueprint = batch_bp
 
-            while batch_idx < len(batches) or in_flight:
-                while (
-                    batch_idx < len(batches)
-                    and len(in_flight) < max_concurrency
-                    and len(out) < local_target
-                ):
-                    mix = batches[batch_idx]
-                    idx = batch_idx + 1
-                    batch_count = sum(mix.values())
-                    batch_bp = local_bp.model_copy(deep=True)
-                    batch_bp.count = batch_count
-                    batch_bp.difficulty_mix = type(local_bp.difficulty_mix)(**mix)
-                    batch_req = local_req.model_copy(deep=True)
-                    batch_req.blueprint = batch_bp
+            log.info(
+                "generation_batch_start",
+                batch=idx,
+                batch_count=batch_count,
+                remaining=local_target - len(out),
+            )
 
-                    log.info(
-                        "generation_batch_start",
-                        batch=idx,
-                        batch_count=batch_count,
-                        remaining=local_target - len(out),
-                    )
+            tasks.append(_generate_for_blueprint(batch_req))
 
-                    future = executor.submit(_generate_for_blueprint, batch_req)
-                    in_flight[future] = idx
-                    batch_idx += 1
+        semaphore = asyncio.Semaphore(GENERATION_BATCH_CONCURRENCY)
 
-                if not in_flight:
-                    break
+        async def limited_task(coro):
+            async with semaphore:
+                return await coro
 
-                done, _ = wait(in_flight.keys(), return_when=FIRST_COMPLETED)
-                for future in done:
-                    idx = in_flight.pop(future, None)
-                    try:
-                        batch_questions, batch_rejected = future.result()
-                        out.extend(batch_questions)
-                        rejected.extend(batch_rejected)
-                    except Exception as exc:  # noqa: BLE001
-                        last_error = exc
-                        log.warning(
-                            "generation_batch_failed",
-                            batch=idx,
-                            error=str(exc)[:500],
-                            error_type=type(exc).__name__,
-                        )
-                        continue
+        limited_tasks = [limited_task(t) for t in tasks]
+        results = await asyncio.gather(*limited_tasks, return_exceptions=True)
+        for idx, result in enumerate(results, start=1):
+            if isinstance(result, Exception):
+                last_error = result
+                log.warning(
+                    "generation_batch_failed",
+                    batch=idx,
+                    error=str(result)[:500],
+                    error_type=type(result).__name__,
+                )
+                continue
+            batch_questions, batch_rejected = result
+            out.extend(batch_questions)
+            rejected.extend(batch_rejected)
 
         return out[:local_target], rejected, last_error
 
-    def _expand_chapters_for_corpus(
+    async def _expand_chapters_for_corpus(
         chapters: list[str],
         *,
         corpus_id: str,
@@ -482,7 +473,7 @@ def generate_questions_sync(req: GenerateRequest, *, document_id: str | None = N
         class_level: int,
         subject: str,
     ) -> list[str]:
-        with get_session() as session:
+        async with get_session_ctx() as session:
             q = (
                 select(Chunk.chapter)
                 .where(Chunk.corpus_id == corpus_id)
@@ -491,7 +482,7 @@ def generate_questions_sync(req: GenerateRequest, *, document_id: str | None = N
             )
             if document_id:
                 q = q.where(Chunk.document_id == document_id)
-            rows = session.exec(q.distinct()).all()
+            rows = (await session.execute(q.distinct())).scalars().all()
         raw = [str(r).strip() for r in rows if r and str(r).strip()]
         if not raw:
             return chapters
@@ -518,11 +509,8 @@ def generate_questions_sync(req: GenerateRequest, *, document_id: str | None = N
                 per_chapter[ch][diff] = base + (1 if idx < remainder else 0)
         return per_chapter
 
-    # Expand chapters for per-chapter generation only when NO chapters were
-    # provided. If the caller provided any chapters (even one), respect that
-    # selection and generate all questions within those chapters — no expansion.
     if bp.constraints.per_chapter and not bp.constraints.chapters:
-        expanded = _expand_chapters_for_corpus(
+        expanded = await _expand_chapters_for_corpus(
             bp.constraints.chapters,
             corpus_id=req.corpus_id,
             document_id=document_id,
@@ -550,7 +538,7 @@ def generate_questions_sync(req: GenerateRequest, *, document_id: str | None = N
             chapter_req = req.model_copy(deep=True)
             chapter_req.blueprint = chapter_bp
 
-            chapter_questions, chapter_rejected, chapter_error = _run_batches_for_request(chapter_req)
+            chapter_questions, chapter_rejected, chapter_error = await _run_batches_for_request(chapter_req)
             all_out_questions.extend(chapter_questions)
             all_rejected.extend(chapter_rejected)
             if chapter_error:
@@ -580,8 +568,7 @@ def generate_questions_sync(req: GenerateRequest, *, document_id: str | None = N
             raise last_error
         return GenerateResponse(job_id=None, questions=all_out_questions, rejected=all_rejected)
 
-    # Default: single-chapter or explicit chapters list (no per-chapter split)
-    all_out_questions, all_rejected, last_error = _run_batches_for_request(req)
+    all_out_questions, all_rejected, last_error = await _run_batches_for_request(req)
     if len(all_out_questions) >= target_count:
         log.info(
             "generation_success",
@@ -609,7 +596,6 @@ def generate_questions_sync(req: GenerateRequest, *, document_id: str | None = N
 
 class _JobDedupeState:
     def __init__(self) -> None:
-        self.lock = Lock()
         self.seen_norm: set[str] = set()
         self.seen_keys: set[str] = set()
         self.inflight_norm: set[str] = set()
@@ -628,7 +614,6 @@ def _normalize_llm_output(payload: dict) -> None:
     if not isinstance(questions, list):
         return
 
-    # Define allowed fields per schema to strip extras
     allowed_fields = {
         "id", "qtype", "difficulty", "language", "stem", "options", 
         "answer", "explanation", "tags", "citations"
@@ -638,48 +623,35 @@ def _normalize_llm_output(payload: dict) -> None:
         if not isinstance(q, dict):
             continue
 
-        # Common alternate keys / shapes.
-        # Some providers return the Niyukti-style schema:
-        # - question_text / question_type / correct_answer
         if "stem" not in q and "question_text" in q:
             q["stem"] = q.pop("question_text")
         
-        # Fix common field name mismatches from OpenRouter/OpenAI models
-        # "type" -> "qtype"
         if "qtype" not in q and "type" in q:
             q["qtype"] = q.pop("type")
         
-        # "citation" (singular) -> "citations" (array)
         if "citations" not in q:
             if "citation" in q:
-                # Convert single citation to array
                 citation = q.pop("citation")
                 q["citations"] = [citation] if isinstance(citation, dict) else []
             else:
-                # Ensure citations array exists (will be validated later)
                 q["citations"] = []
         if "stem" not in q and "question" in q:
             q["stem"] = q.pop("question")
         if "answer" not in q and "correct_answer" in q:
             q["answer"] = q.pop("correct_answer")
-        # Also handle "correct_option" -> "answer" for MCQ
         if "answer" not in q and "correct_option" in q:
             q["answer"] = q.pop("correct_option")
 
-        # Normalize question type keys, including occasional typos.
-        # Example typo seen in logs: "queuestuestion_type"
         if "qtype" not in q:
             if "question_type" in q:
                 q["qtype"] = q.pop("question_type")
             else:
-                # Best-effort: any key that contains "uestion_type"
                 for k in list(q.keys()):
                     lk = k.lower()
                     if "uestion_type" in lk:
                         q["qtype"] = q.pop(k)
                         break
 
-        # Normalize qtype values to our enum-like set
         if "qtype" in q and isinstance(q["qtype"], str):
             qt = q["qtype"].strip().lower()
             if qt in {"multiple_choice", "multiple choice", "mcq"}:
@@ -689,13 +661,10 @@ def _normalize_llm_output(payload: dict) -> None:
             elif qt in {"short_answer", "short"}:
                 q["qtype"] = "short"
 
-        # Normalize options array: Gemini sometimes returns objects like {'id': 'opt1', 'text': '...'}
-        # Schema expects simple strings, so extract 'text' field from option objects
         if "options" in q and isinstance(q["options"], list):
             normalized_options = []
             for opt in q["options"]:
                 if isinstance(opt, dict):
-                    # Extract 'text' field if present, otherwise use first string value
                     if "text" in opt:
                         normalized_options.append(str(opt["text"]))
                     elif "value" in opt:
@@ -703,7 +672,6 @@ def _normalize_llm_output(payload: dict) -> None:
                     elif "option" in opt:
                         normalized_options.append(str(opt["option"]))
                     else:
-                        # Try to find any string value in the object
                         for val in opt.values():
                             if isinstance(val, str):
                                 normalized_options.append(val)
@@ -711,23 +679,16 @@ def _normalize_llm_output(payload: dict) -> None:
                 elif isinstance(opt, str):
                     normalized_options.append(opt)
                 else:
-                    # Convert to string as last resort
                     normalized_options.append(str(opt))
             q["options"] = normalized_options
 
-        # Strip extra fields that aren't in schema (e.g., "chapter", "correct_option")
-        # This prevents schema validation failures from Gemini adding extra fields
         extra_fields = [k for k in q.keys() if k not in allowed_fields]
         for field in extra_fields:
-            # If it's "chapter", try to move it to tags.chapter if tags exists
             if field == "chapter" and isinstance(q.get("tags"), dict):
                 q.setdefault("tags", {})["chapter"] = q.pop(field)
             else:
-                # Remove other extra fields
                 q.pop(field, None)
 
-        # Ensure required keys exist (even if empty) so schema validation can
-        # report meaningful issues later.
         q.setdefault("language", "en")
         q.setdefault("tags", {})
         q.setdefault("difficulty", "easy")
@@ -741,9 +702,7 @@ def _blueprint_to_query(bp) -> str:
     return f"CBSE {bp.constraints.subject} class {bp.constraints.class_level}. Chapters: {', '.join(bp.constraints.chapters)}. {role}. {skills}. {focus}"
 
 
-def _document_uri_map(corpus_id: str) -> dict[str, str]:
-    with get_session() as session:
-        docs = session.exec(select(Document).where(Document.corpus_id == corpus_id)).all()
+async def _document_uri_map(corpus_id: str) -> dict[str, str]:
+    async with get_session_ctx() as session:
+        docs = (await session.execute(select(Document).where(Document.corpus_id == corpus_id))).scalars().all()
     return {d.id: d.storage_uri for d in docs}
-
-

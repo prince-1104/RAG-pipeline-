@@ -9,6 +9,7 @@ import httpx
 from app.llm.base import LLMResult
 from app.llm.stub import StubLLMClient
 from app.observability.agentbill import finalize_event, start_event
+from app.observability.logging import log
 
 
 def _repair_json(text: str) -> str:
@@ -190,21 +191,25 @@ class GeminiClient:
     def generate_json(self, *, system_prompt: str, user_prompt: str, json_schema: dict[str, Any]) -> LLMResult:
         # This is intentionally conservative: we request JSON-only and validate downstream.
         #
-        # Gemini model naming is a common integration pitfall (some projects use
-        # gemini-1.5-pro vs gemini-1.5-pro-latest, etc.). If the configured model
-        # 404s, we retry a small set of safe fallbacks.
+        # Gemini model naming is a common integration pitfall. Use only v1beta and
+        # model names supported by Google Generative Language API. If the configured
+        # model 404s, we retry a small set of safe fallbacks.
+        log.info("llm_request", provider="gemini", model=self.model)
+
         event = start_event(
             event_name="ai_completion",
             provider="gemini",
             model=self.model,
             kind="completion",
         )
-        def _url(api_version: str, model: str) -> str:
-            return f"https://generativelanguage.googleapis.com/{api_version}/models/{model}:generateContent"
+        # Use v1beta only; v1 does not support all models (e.g. gemini-1.5-flash).
+        api_version = "v1beta"
+        def _url(ver: str, model: str) -> str:
+            return f"https://generativelanguage.googleapis.com/{ver}/models/{model}:generateContent"
 
         models_to_try = [self.model]
-        # Add common fallbacks (avoid duplicates) - using newer Gemini 2.x models
-        for m in ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.0-flash", "gemini-1.5-pro-latest", "gemini-1.5-flash-latest"]:
+        # Valid fallbacks per Google API (no -latest suffix, no 2.5)
+        for m in ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"]:
             if m not in models_to_try:
                 models_to_try.append(m)
 
@@ -249,133 +254,106 @@ class GeminiClient:
         last_url: str | None = None
         error_details: list[dict[str, Any]] = []
         data: dict[str, Any] | None = None
-        
+        abort_auth = False
+
         with httpx.Client(timeout=self.timeout_s) as client:
-            # Try both API surfaces; some projects succeed with v1 when v1beta fails
-            for api_version in ["v1beta", "v1"]:
-                for model in models_to_try:
-                    for body_name, body in [("json_mode", body_json_mode), ("compat_mode", body_compat_mode)]:
-                        try:
-                            url = _url(api_version, model)
-                            last_url = url
-                            resp = client.post(url, headers=headers, params=params, json=body)
-                            last_status = resp.status_code
-                            last_resp_text = resp.text
+            for model in models_to_try:
+                if abort_auth:
+                    break
+                for body_name, body in [("json_mode", body_json_mode), ("compat_mode", body_compat_mode)]:
+                    try:
+                        url = _url(api_version, model)
+                        last_url = url
+                        resp = client.post(url, headers=headers, params=params, json=body)
+                        last_status = resp.status_code
+                        last_resp_text = resp.text
 
-                            # Handle specific status codes
-                            if resp.status_code == 404:
-                                # Model not found - try next fallback
-                                error_details.append({
-                                    "model": model,
-                                    "api_version": api_version,
-                                    "mode": body_name,
-                                    "status": 404,
-                                    "error": "model_not_found"
-                                })
-                                continue
-                            
-                            if resp.status_code == 400:
-                                # Bad request - might be API key issue, invalid payload, or unsupported feature
-                                # Try to parse error message for better diagnostics
-                                try:
-                                    error_json = resp.json()
-                                    error_msg = error_json.get("error", {}).get("message", resp.text[:200])
-                                    # If error mentions responseSchema or schema, skip json_mode for this model
-                                    if "schema" in error_msg.lower() or "responseSchema" in error_msg.lower():
-                                        # Skip json_mode for this model, try compat_mode instead
-                                        if body_name == "json_mode":
-                                            continue
-                                except Exception:
-                                    error_msg = resp.text[:200]
-                                
-                                error_details.append({
-                                    "model": model,
-                                    "api_version": api_version,
-                                    "mode": body_name,
-                                    "status": 400,
-                                    "error": error_msg
-                                })
-                                # Continue trying other models/modes for 400 errors
-                                # (might be model-specific issue or unsupported feature)
-                                continue
-                            
-                            if resp.status_code == 401 or resp.status_code == 403:
-                                # Authentication/authorization error - likely API key issue
-                                # Don't try other models, this is a key problem
-                                try:
-                                    error_json = resp.json()
-                                    error_msg = error_json.get("error", {}).get("message", resp.text[:200])
-                                except Exception:
-                                    error_msg = resp.text[:200]
-                                
-                                # Log detailed error
-                                import logging
-                                logger = logging.getLogger(__name__)
-                                logger.error(
-                                    f"Gemini API authentication failed: {error_msg}",
-                                    extra={
-                                        "status": resp.status_code,
-                                        "url": url,
-                                        "model": model,
-                                        "api_version": api_version
-                                    }
-                                )
-                                
-                                # Still try stub fallback rather than failing completely
-                                # Break out of all loops
-                                data = None  # Ensure we go to fallback
-                                break
-
-                            # For other non-2xx status codes, raise to be caught below
-                            resp.raise_for_status()
-                            data = resp.json()
-                            # Success! Break out of all loops using a flag
-                            break
-                        except httpx.HTTPStatusError as e:
-                            last_exception = e
-                            try:
-                                last_status = e.response.status_code
-                                last_resp_text = e.response.text
-                                # Only log non-404/400 errors (already handled above)
-                                if e.response.status_code not in (404, 400, 401, 403):
-                                    error_details.append({
-                                        "model": model,
-                                        "api_version": api_version,
-                                        "mode": body_name,
-                                        "status": e.response.status_code,
-                                        "error": e.response.text[:200]
-                                    })
-                            except Exception:
-                                pass
-                            # Keep trying other (api_version, model, body) combos
-                            continue
-                        except Exception as e:
-                            # For other errors (network, timeout, etc.), save and try next model
-                            last_exception = e
+                        # Handle specific status codes
+                        if resp.status_code == 404:
                             error_details.append({
                                 "model": model,
                                 "api_version": api_version,
                                 "mode": body_name,
-                                "status": None,
-                                "error": str(e)[:200]
+                                "status": 404,
+                                "error": "model_not_found"
                             })
                             continue
-                        
-                        # Check if we got successful data, break out of nested loops
-                        if data is not None:
+
+                        if resp.status_code == 400:
+                            try:
+                                error_json = resp.json()
+                                error_msg = error_json.get("error", {}).get("message", resp.text[:200])
+                                if "schema" in error_msg.lower() or "responseSchema" in error_msg.lower():
+                                    if body_name == "json_mode":
+                                        continue
+                            except Exception:
+                                error_msg = resp.text[:200]
+
+                            error_details.append({
+                                "model": model,
+                                "api_version": api_version,
+                                "mode": body_name,
+                                "status": 400,
+                                "error": error_msg
+                            })
+                            continue
+
+                        if resp.status_code == 401 or resp.status_code == 403:
+                            try:
+                                error_json = resp.json()
+                                error_msg = error_json.get("error", {}).get("message", resp.text[:200])
+                            except Exception:
+                                error_msg = resp.text[:200]
+                            log.error(
+                                "gemini_auth_failed",
+                                error=error_msg,
+                                status=resp.status_code,
+                                url=url,
+                                model=model,
+                                api_version=api_version,
+                            )
+                            data = None
+                            abort_auth = True
                             break
+
+                        resp.raise_for_status()
+                        data = resp.json()
+                        break
+                    except httpx.HTTPStatusError as e:
+                        last_exception = e
+                        try:
+                            last_status = e.response.status_code
+                            last_resp_text = e.response.text
+                            if e.response.status_code not in (404, 400, 401, 403):
+                                error_details.append({
+                                    "model": model,
+                                    "api_version": api_version,
+                                    "mode": body_name,
+                                    "status": e.response.status_code,
+                                    "error": e.response.text[:200]
+                                })
+                        except Exception:
+                            pass
+                        continue
+                    except Exception as e:
+                        last_exception = e
+                        error_details.append({
+                            "model": model,
+                            "api_version": api_version,
+                            "mode": body_name,
+                            "status": None,
+                            "error": str(e)[:200]
+                        })
+                        continue
+
                     if data is not None:
                         break
-                if data is not None:
+                if data is not None or abort_auth:
                     break
             else:
                 # All attempts failed. Fall back to deterministic stub so the service
                 # remains usable in local/dev (Niyukti integration testing) even if
                 # the configured Gemini model name is unavailable.
-                import logging
-                logger = logging.getLogger(__name__)
-                
-                # Build comprehensive error message
                 error_summary = []
                 if last_status:
                     error_summary.append(f"HTTP {last_status}")
@@ -390,17 +368,15 @@ class GeminiClient:
                         error_summary.append(f"Response: {last_resp_text[:200]}")
                 
                 error_msg = "; ".join(error_summary) if error_summary else str(last_exception)[:500]
-                
-                # Log all attempted configurations for debugging
-                logger.warning(
-                    f"All Gemini models failed ({len(error_details)} attempts), falling back to stub. "
-                    f"Last error: {error_msg}",
-                    extra={"attempts": error_details, "last_status": last_status, "last_url": last_url}
+                log.warning(
+                    "gemini_all_models_failed_fallback_stub",
+                    attempts=len(error_details),
+                    last_status=last_status,
+                    last_url=last_url,
+                    last_error=error_msg[:500],
                 )
-                
-                # Fallback to stub - this should always succeed
                 try:
-                    logger.info("Using stub LLM as fallback")
+                    log.info("llm_fallback_stub_used", provider="gemini")
                     finalize_event(
                         event,
                         success=False,
@@ -408,8 +384,7 @@ class GeminiClient:
                     )
                     return StubLLMClient().generate_json(system_prompt=system_prompt, user_prompt=user_prompt, json_schema=json_schema)
                 except Exception as stub_error:
-                    # If even stub fails, raise a clear error
-                    logger.error(f"Stub LLM also failed: {stub_error}")
+                    log.error("llm_stub_fallback_failed", error=str(stub_error))
                     finalize_event(
                         event,
                         success=False,
@@ -477,14 +452,10 @@ class GeminiClient:
             parsed = json.loads(text)
         except json.JSONDecodeError as e:
             parse_error = e
-            # Second attempt: try repairing common issues
             try:
                 repaired = _repair_json(text)
                 parsed = json.loads(repaired)
-                # Log that repair worked (for monitoring)
-                import logging
-                logger = logging.getLogger(__name__)
-                logger.debug("gemini_json_repair_succeeded", original_error=str(e)[:100])
+                log.debug("gemini_json_repair_succeeded", original_error=str(e)[:100])
             except Exception as repair_error:
                 # Repair failed, will raise original error below
                 pass

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 from fastapi import APIRouter, HTTPException
 
 from app.api.v1.schemas.rag import RAGGenerateRequest, RAGGenerateResponse, RAGQuestionOut
@@ -12,7 +14,7 @@ router = APIRouter()
 
 
 @router.post("/generate/questions", response_model=RAGGenerateResponse)
-def rag_generate_questions(req: RAGGenerateRequest) -> RAGGenerateResponse:
+async def rag_generate_questions(req: RAGGenerateRequest) -> RAGGenerateResponse:
     """
     Generate assessment questions from Qdrant-backed RAG.
 
@@ -20,7 +22,8 @@ def rag_generate_questions(req: RAGGenerateRequest) -> RAGGenerateResponse:
     calls LLM with grounded prompt, returns structured questions only.
     """
     try:
-        result = generate_questions(
+        result = await asyncio.to_thread(
+            generate_questions,
             board=req.board,
             class_val=req.class_,
             subject=req.subject,

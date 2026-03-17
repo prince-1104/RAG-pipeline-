@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from app.api.v1.schemas.generation import Blueprint
 from app.retrieval.retriever import RetrievalResult
+
+if TYPE_CHECKING:
+    from app.vector_store.search import SearchChunkResult
 
 
 def build_system_prompt() -> str:
@@ -95,3 +100,63 @@ def build_user_prompt(*, blueprint: Blueprint, retrieval: RetrievalResult, docum
     )
 
 
+def build_school_question_prompt(
+    *,
+    chunks: list[SearchChunkResult],
+    count: int,
+    difficulty: str,
+    question_type: str,
+    subject: str | None,
+    chapter: str | None,
+    language: str,
+) -> str:
+    """Build an LLM prompt for the school self-service question generation endpoint."""
+    context = "\n\n".join(c.text for c in chunks)
+
+    if question_type == "mcq":
+        type_instruction = (
+            "Each question must have exactly 4 options labeled A, B, C, D. "
+            "Mark the correct answer clearly."
+        )
+    elif question_type == "long":
+        type_instruction = (
+            "Each question must be a descriptive/long-answer question. "
+            "Provide a model answer."
+        )
+    else:
+        type_instruction = (
+            "Mix MCQ and long-answer questions. For MCQ include 4 options. "
+            "For long-answer provide a model answer."
+        )
+
+    return f"""You are an expert teacher creating exam questions.
+
+Context extracted from the uploaded study material:
+\"\"\"
+{context}
+\"\"\"
+
+Task: Generate exactly {count} {difficulty}-difficulty questions.
+Subject: {subject or 'as inferred from context'}
+Chapter: {chapter or 'as inferred from context'}
+Language: {language}
+
+{type_instruction}
+
+Difficulty guidelines:
+- easy: factual recall, single-concept, direct from text
+- medium: application, comparison, multi-step reasoning
+- hard: analysis, synthesis, inference beyond the text
+
+Return ONLY a valid JSON array. No markdown, no explanation, no preamble:
+[
+  {{
+    "question": "...",
+    "type": "mcq" or "long",
+    "difficulty": "{difficulty}",
+    "options": ["A. ...", "B. ...", "C. ...", "D. ..."] or null,
+    "correct_answer": "...",
+    "explanation": "...",
+    "source_chapter": "..."
+  }}
+]"""

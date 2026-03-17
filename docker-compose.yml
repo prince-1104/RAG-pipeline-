@@ -7,14 +7,52 @@ services:
       - .env
     volumes:
       - ./:/app
-    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080", "--reload"]
+    command:
+      [
+        "gunicorn",
+        "app.main:app",
+        "--worker-class", "uvicorn.workers.UvicornWorker",
+        "--workers", "4",
+        "--bind", "0.0.0.0:8080",
+        "--timeout", "120",
+      ]
 
-  worker:
+  worker-index-1:
     build: .
     env_file:
       - .env
     volumes:
       - ./:/app
-    command: ["python", "-m", "app.worker"]
+    command: ["python", "-m", "app.worker", "--job-kinds", "index,ingest", "--concurrency", "2", "--worker-id", "index-1"]
 
+  worker-index-2:
+    build: .
+    env_file:
+      - .env
+    volumes:
+      - ./:/app
+    command: ["python", "-m", "app.worker", "--job-kinds", "index,ingest", "--concurrency", "2", "--worker-id", "index-2"]
 
+  worker-gen-1:
+    build: .
+    env_file:
+      - .env
+    volumes:
+      - ./:/app
+    command: ["python", "-m", "app.worker", "--job-kinds", "generate,admin_generate_questions,generate_question_pool,refresh_question_pool", "--concurrency", "1", "--worker-id", "gen-1"]
+
+  worker-gen-2:
+    build: .
+    env_file:
+      - .env
+    volumes:
+      - ./:/app
+    command: ["python", "-m", "app.worker", "--job-kinds", "generate,admin_generate_questions,generate_question_pool,refresh_question_pool", "--concurrency", "1", "--worker-id", "gen-2"]
+
+  worker-gen-3:
+    build: .
+    env_file:
+      - .env
+    volumes:
+      - ./:/app
+    command: ["python", "-m", "app.worker", "--job-kinds", "generate,admin_generate_questions,generate_question_pool,refresh_question_pool", "--concurrency", "1", "--worker-id", "gen-3"]

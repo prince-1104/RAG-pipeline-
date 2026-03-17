@@ -7,6 +7,7 @@ import httpx
 
 from app.llm.base import LLMResult
 from app.observability.agentbill import finalize_event, start_event
+from app.observability.logging import log
 
 
 class OpenAIClient:
@@ -32,13 +33,14 @@ class OpenAIClient:
         self.temperature = temperature
         self.max_tokens = max_tokens
 
-    def generate_json(self, *, system_prompt: str, user_prompt: str, json_schema: dict[str, Any]) -> LLMResult:
+    def _build_request(
+        self, *, system_prompt: str, user_prompt: str, json_schema: dict[str, Any]
+    ) -> tuple[str, dict[str, str], dict[str, Any]]:
         url = f"{self.base_url}/chat/completions"
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.api_key}",
         }
-
         schema_description = ""
         if json_schema:
             schema_description = (
@@ -61,16 +63,9 @@ class OpenAIClient:
             "max_tokens": self.max_tokens,
             "response_format": {"type": "json_object"},
         }
+        return url, headers, payload
 
-        event = start_event(
-            event_name="ai_completion",
-            provider="openai",
-            model=self.model,
-            kind="completion",
-        )
-        with httpx.Client(timeout=self.timeout_s) as client:
-            resp = client.post(url, headers=headers, json=payload)
-
+    def _handle_response(self, resp: httpx.Response, event: dict[str, Any]) -> LLMResult:
         if resp.status_code in (401, 403):
             finalize_event(
                 event,
@@ -141,4 +136,38 @@ class OpenAIClient:
             attributes={"ai.response_id": data.get("id")},
         )
         return LLMResult(raw_text=text, parsed_json=parsed)
+
+    def generate_json(self, *, system_prompt: str, user_prompt: str, json_schema: dict[str, Any]) -> LLMResult:
+        log.info("llm_request", provider="openai", model=self.model)
+        url, headers, payload = self._build_request(
+            system_prompt=system_prompt, user_prompt=user_prompt, json_schema=json_schema
+        )
+
+        event = start_event(
+            event_name="ai_completion",
+            provider="openai",
+            model=self.model,
+            kind="completion",
+        )
+        with httpx.Client(timeout=self.timeout_s) as client:
+            resp = client.post(url, headers=headers, json=payload)
+        return self._handle_response(resp, event)
+
+    async def async_generate_json(
+        self, *, system_prompt: str, user_prompt: str, json_schema: dict[str, Any]
+    ) -> LLMResult:
+        log.info("llm_request", provider="openai", model=self.model)
+        url, headers, payload = self._build_request(
+            system_prompt=system_prompt, user_prompt=user_prompt, json_schema=json_schema
+        )
+
+        event = start_event(
+            event_name="ai_completion",
+            provider="openai",
+            model=self.model,
+            kind="completion",
+        )
+        async with httpx.AsyncClient(timeout=self.timeout_s) as client:
+            resp = await client.post(url, headers=headers, json=payload)
+        return self._handle_response(resp, event)
 

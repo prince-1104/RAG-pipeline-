@@ -5,10 +5,10 @@ import re
 from dataclasses import dataclass
 
 import numpy as np
-from sqlmodel import select
+from sqlalchemy import select
 
 from app.db.models import GeneratedQuestion
-from app.db.session import get_session
+from app.db.session import get_session_ctx
 from app.indexing.qdrant_index import embed_texts
 from app.observability.logging import log
 
@@ -26,17 +26,17 @@ class GuardrailReject:
     details: dict
 
 
-def reject_if_exact_duplicate(*, corpus_id: str, key: str) -> GuardrailReject | None:
-    with get_session() as session:
-        existing = session.exec(
+async def reject_if_exact_duplicate(*, corpus_id: str, key: str) -> GuardrailReject | None:
+    async with get_session_ctx() as session:
+        existing = (await session.execute(
             select(GeneratedQuestion).where(GeneratedQuestion.corpus_id == corpus_id, GeneratedQuestion.dedupe_key == key).limit(1)
-        ).first()
+        )).scalars().first()
     if existing:
         return GuardrailReject(reason="DUPLICATE_QUESTION", details={"dedupe_key": key, "existing_question_id": existing.id})
     return None
 
 
-def reject_if_embedding_duplicate(
+async def reject_if_embedding_duplicate(
     *,
     corpus_id: str,
     stem: str,
@@ -48,13 +48,13 @@ def reject_if_embedding_duplicate(
     - compare new stem embedding against recent stems in corpus
     - reject if cosine similarity exceeds threshold
     """
-    with get_session() as session:
-        recent = session.exec(
+    async with get_session_ctx() as session:
+        recent = (await session.execute(
             select(GeneratedQuestion)
             .where(GeneratedQuestion.corpus_id == corpus_id)
             .order_by(GeneratedQuestion.created_at.desc())
             .limit(recent_limit)
-        ).all()
+        )).scalars().all()
 
     if not recent:
         return None
@@ -114,7 +114,7 @@ def reject_if_low_support(*, answer: str | None, explanation: str | None, excerp
     """
     Basic factual support check:
     - require overlap of key tokens between (answer+explanation) and excerpt
-    - reject obvious “free-floating” answers
+    - reject obvious "free-floating" answers
     """
     text = " ".join([answer or "", explanation or ""]).strip().lower()
     if not text:
@@ -132,5 +132,3 @@ def reject_if_low_support(*, answer: str | None, explanation: str | None, excerp
     if overlap < 0.18:
         return GuardrailReject(reason="INSUFFICIENT_CONTEXT", details={"token_overlap": overlap})
     return None
-
-

@@ -55,8 +55,15 @@ class APIKeyMiddleware(BaseHTTPMiddleware):
         if path in skip_paths or not path.startswith(protected_prefixes):
             return await call_next(request)
         
-        # If no API keys configured, skip authentication
+        # If no API keys configured, still extract tenant header then skip auth
         if not settings.api_key and not settings.api_keys:
+            request.state.tenant_id = request.headers.get("X-Tenant-ID", None)
+            if path.startswith(("/v1/school/", "/v1/school")):
+                if not request.state.tenant_id:
+                    return ORJSONResponse(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        content={"detail": "X-Tenant-ID header is required for school endpoints"},
+                    )
             return await call_next(request)
         
         # Get API key from header (X-API-Key or Authorization: Bearer)
@@ -80,5 +87,16 @@ class APIKeyMiddleware(BaseHTTPMiddleware):
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 content={"detail": "invalid_api_key"},
             )
-        
+
+        # Inject tenant_id from X-Tenant-ID header into request.state
+        request.state.tenant_id = request.headers.get("X-Tenant-ID", None)
+
+        # School endpoints require X-Tenant-ID
+        if path.startswith(("/v1/school/", "/v1/school")):
+            if not request.state.tenant_id:
+                return ORJSONResponse(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    content={"detail": "X-Tenant-ID header is required for school endpoints"},
+                )
+
         return await call_next(request)

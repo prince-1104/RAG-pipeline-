@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import concurrent.futures
+import asyncio
 import json
 import uuid
 from typing import Literal
@@ -12,7 +12,7 @@ from app.db.models import (
     QuestionPool,
     QuestionPoolStatus,
 )
-from app.db.session import get_session
+from app.db.session import get_session_ctx
 from app.generation.guardrails import (
     dedupe_key_for,
     reject_if_embedding_duplicate,
@@ -33,7 +33,7 @@ from app.pools.service import (
 )
 from app.retrieval.retriever import retrieve
 from app.settings import get_settings
-from sqlmodel import select
+from sqlalchemy import select
 
 
 def _pool_system_prompt(difficulty: str) -> str:
@@ -169,7 +169,7 @@ def _ensure_question_minimums(
         ]
 
 
-def generate_question_pool(
+async def generate_question_pool(
     corpus_id: str,
     syllabus: str,
     class_level: int,
@@ -192,7 +192,7 @@ def generate_question_pool(
     7. Mark pool as READY
     """
     # Step 1: Get or create pool
-    pool = get_or_create_pool(syllabus, class_level, subject, chapter, difficulty, syllabus_version)
+    pool = await get_or_create_pool(syllabus, class_level, subject, chapter, difficulty, syllabus_version)
     # Do not generate beyond requested_count (if already satisfied)
     if pool.requested_count is not None and pool.generated_count is not None:
         if int(pool.generated_count) >= int(pool.requested_count):
@@ -211,7 +211,7 @@ def generate_question_pool(
     
     # Mark as generating only if not already serving from a partial pool.
     if pool.status != QuestionPoolStatus.ready_partial:
-        mark_pool_generating(pool.id)
+        await mark_pool_generating(pool.id)
     
     try:
         s = get_settings()
@@ -236,7 +236,7 @@ def generate_question_pool(
         query = f"{syllabus} {subject} class {class_level} chapter {chapter} syllabus version {syllabus_version}"
         
         # Use a generic query that retrieves diverse content
-        rr = retrieve(
+        rr = await retrieve(
             corpus_id=corpus_id,
             class_level=class_level,
             subject=subject,
@@ -253,12 +253,12 @@ def generate_question_pool(
         log.info("chunks_retrieved_for_pool", pool_id=pool.id, chunk_count=len(rr.chunks))
         
         # Get document URIs
-        with get_session() as session:
-            docs = session.exec(select(Document).where(Document.corpus_id == corpus_id)).all()
+        async with get_session_ctx() as session:
+            docs = (await session.execute(select(Document).where(Document.corpus_id == corpus_id))).scalars().all()
         doc_uri_map = {d.id: d.storage_uri for d in docs}
         
         # Step 3: Phase 1 - Extract examinable concepts (+ supporting chunk_id)
-        extracted = _extract_concepts(rr, doc_uri_map, difficulty)
+        extracted = await _extract_concepts(rr, doc_uri_map, difficulty)
         concepts = [c["name"] for c in extracted]
         concept_to_chunk_id = {c["name"]: c.get("chunk_id", "") for c in extracted}
         
@@ -280,11 +280,9 @@ def generate_question_pool(
             max_workers=max_workers,
         )
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_concept: dict[concurrent.futures.Future[list[dict]], str] = {}
-            for concept in concepts:
-                future = executor.submit(
-                    _generate_questions_for_concept,
+        results = await asyncio.gather(
+            *[
+                _generate_questions_for_concept(
                     concept=concept,
                     retrieval=rr,
                     doc_uri_map=doc_uri_map,
@@ -293,23 +291,17 @@ def generate_question_pool(
                     corpus_id=corpus_id,
                     preferred_chunk_id=concept_to_chunk_id.get(concept) or None,
                 )
-                future_to_concept[future] = concept
-
-            for future in concurrent.futures.as_completed(future_to_concept.keys()):
-                concept = future_to_concept[future]
-                try:
-                    concept_questions = future.result()
-                    all_questions.extend(concept_questions)
-                except Exception as e:  # noqa: BLE001
-                    log.warning("concept_generation_failed", concept=concept, error=str(e)[:200])
-                    continue
-
-                if len(all_questions) >= target_count:
-                    # Best-effort cancellation of remaining work
-                    for f in future_to_concept.keys():
-                        if f is not future:
-                            f.cancel()
-                    break
+                for concept in concepts
+            ],
+            return_exceptions=True,
+        )
+        for concept, result in zip(concepts, results):
+            if isinstance(result, BaseException):
+                log.warning("concept_generation_failed", concept=concept, error=str(result)[:200])
+                continue
+            all_questions.extend(result)
+            if len(all_questions) >= target_count:
+                break
 
         generated = len(all_questions)
         log.info(
@@ -322,16 +314,16 @@ def generate_question_pool(
 
         if generated == 0:
             # Hard fail only when absolutely nothing was generated.
-            mark_pool_failed(pool.id, "insufficient_questions:0")
+            await mark_pool_failed(pool.id, "insufficient_questions:0")
             return
 
         # Step 5: Store questions in DB
-        question_ids = _store_pool_questions(pool.id, all_questions, corpus_id, class_level, subject)
+        question_ids = await _store_pool_questions(pool.id, all_questions, corpus_id, class_level, subject)
 
         # Step 6: Add to Redis and set pool status
         if generated < requested_count:
             # Best-effort: partial pool is still serveable; trigger backfill via API path if needed.
-            add_questions_to_pool(
+            await add_questions_to_pool(
                 pool.id,
                 question_ids,
                 requested_count=requested_count,
@@ -340,14 +332,14 @@ def generate_question_pool(
                 last_error=("insufficient_questions" if generated < min_acceptable else None),
             )
             # Persist status/counters even if Redis add fails
-            mark_pool_ready_partial(
+            await mark_pool_ready_partial(
                 pool.id,
                 requested_count=requested_count,
                 generated_count=generated,
                 last_error=("insufficient_questions" if generated < min_acceptable else None),
             )
         else:
-            add_questions_to_pool(
+            await add_questions_to_pool(
                 pool.id,
                 question_ids,
                 requested_count=requested_count,
@@ -361,11 +353,11 @@ def generate_question_pool(
     except Exception as e:
         # Do not crash the worker; mark failed and exit.
         log.exception("pool_generation_error", pool_id=pool.id, error=str(e))
-        mark_pool_failed(pool.id, str(e)[:500])
+        await mark_pool_failed(pool.id, str(e)[:500])
         return
 
 
-def _extract_concepts(
+async def _extract_concepts(
     retrieval_result,
     doc_uri_map: dict[str, str],
     difficulty: str,
@@ -410,7 +402,8 @@ def _extract_concepts(
     ])
     
     try:
-        result = client.generate_json(
+        result = await asyncio.to_thread(
+            client.generate_json,
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             json_schema=_concept_chunk_id_schema(),
@@ -452,7 +445,7 @@ def _extract_concepts(
         return [{"name": str(ch), "chunk_id": ""} for ch in list({r.chunk.chapter for r in retrieval_result.chunks[:5] if r.chunk.chapter})]
 
 
-def _generate_questions_for_concept(
+async def _generate_questions_for_concept(
     concept: str,
     retrieval,
     doc_uri_map: dict[str, str],
@@ -519,7 +512,8 @@ def _generate_questions_for_concept(
     ])
     
     try:
-        result = client.generate_json(
+        result = await asyncio.to_thread(
+            client.generate_json,
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             json_schema=QUESTION_SET_SCHEMA,
@@ -613,7 +607,7 @@ def _generate_questions_for_concept(
         return []
 
 
-def _store_pool_questions(
+async def _store_pool_questions(
     pool_id: str,
     questions: list[dict],
     corpus_id: str,
@@ -623,7 +617,7 @@ def _store_pool_questions(
     """Store questions in PoolQuestion table and return question IDs."""
     question_ids = []
     
-    with get_session() as session:
+    async with get_session_ctx() as session:
         for q in questions:
             q_id = str(uuid.uuid4())
             question_ids.append(q_id)
@@ -650,7 +644,7 @@ def _store_pool_questions(
             )
             session.add(pool_question)
         
-        session.commit()
+        await session.commit()
     
     log.info("pool_questions_stored", pool_id=pool_id, count=len(question_ids))
     return question_ids

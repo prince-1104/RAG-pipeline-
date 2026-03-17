@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 
 from fastapi import APIRouter, HTTPException, Request
-from sqlmodel import select
+from sqlalchemy import select
 
 from app.api.v1.schemas.admin import (
     AdminBatchGenerateQuestionsRequest,
@@ -19,7 +19,7 @@ from app.api.v1.schemas.admin import (
     DocumentJobStatus,
 )
 from app.db.models import Corpus, Document, GeneratedQuestion, GenerationJob, JobKind, JobStatus
-from app.db.session import get_session
+from app.db.session import get_session_ctx
 from app.observability.logging import log
 from app.pools.service import (
     fail_prewarm_run,
@@ -35,7 +35,7 @@ router = APIRouter()
 
 
 @router.get("/generated-questions", response_model=AdminGeneratedQuestionsResponse)
-def admin_get_generated_questions(
+async def admin_get_generated_questions(
     generation_job_id: str | None = None,
     document_id: str | None = None,
     class_level: int | None = None,
@@ -45,7 +45,7 @@ def admin_get_generated_questions(
     qtype: str | None = None,
     language: str | None = None,
 ):
-    with get_session() as session:
+    async with get_session_ctx() as session:
         stmt = select(GeneratedQuestion)
         if generation_job_id:
             stmt = stmt.where(GeneratedQuestion.job_id == generation_job_id)
@@ -64,9 +64,9 @@ def admin_get_generated_questions(
         if language:
             stmt = stmt.where(GeneratedQuestion.language == language)
 
-        rows = session.exec(
+        rows = (await session.execute(
             stmt.order_by(GeneratedQuestion.created_at, GeneratedQuestion.id)
-        ).all()
+        )).scalars().all()
 
     questions: list[AdminGeneratedQuestionOut] = []
     for row in rows:
@@ -93,7 +93,7 @@ def admin_get_generated_questions(
 
 
 @router.post("/generate-questions", response_model=AdminGenerateQuestionsResponse)
-def admin_generate_questions(request: Request, req: AdminGenerateQuestionsRequest):
+async def admin_generate_questions(request: Request, req: AdminGenerateQuestionsRequest):
     """
     Admin endpoint to enqueue pool-generation intent for uploaded PDFs.
     
@@ -113,40 +113,32 @@ def admin_generate_questions(request: Request, req: AdminGenerateQuestionsReques
     
     The intent is stored and expanded into pool-generation jobs by the worker.
     """
-    # Get tenant_id from header (admin should be authenticated)
     tenant_id = request.headers.get("X-Tenant-ID", "niyukti-platform")
     
-    # Validate document exists
-    with get_session() as session:
-        document = session.get(Document, req.document_id)
+    async with get_session_ctx() as session:
+        document = await session.get(Document, req.document_id)
         if not document:
             raise HTTPException(status_code=404, detail="document_not_found")
         
-        # Get corpus
-        corpus = session.get(Corpus, document.corpus_id)
+        corpus = await session.get(Corpus, document.corpus_id)
         if not corpus:
             raise HTTPException(status_code=404, detail="corpus_not_found")
         
-        # Validate tenant matches
         if corpus.tenant_id != tenant_id:
             raise HTTPException(status_code=403, detail="tenant_mismatch")
         
-        # Validate class range
         if req.from_class > req.to_class:
             raise HTTPException(
                 status_code=400,
                 detail="from_class_must_be_less_than_or_equal_to_to_class"
             )
         
-        # Validate document has required metadata
         if not document.class_level or not document.subject:
             raise HTTPException(
                 status_code=400,
                 detail="document_missing_required_metadata_class_level_and_subject_required"
             )
         
-        # Create admin generation job
-        # Generate questions for each class in the range
         job_data = {
             "document_id": req.document_id,
             "corpus_id": document.corpus_id,
@@ -169,8 +161,8 @@ def admin_generate_questions(request: Request, req: AdminGenerateQuestionsReques
             request_json=json.dumps(job_data),
         )
         session.add(job)
-        session.commit()
-        session.refresh(job)
+        await session.commit()
+        await session.refresh(job)
         
         log.info(
             "admin_question_generation_job_created",
@@ -192,7 +184,7 @@ def admin_generate_questions(request: Request, req: AdminGenerateQuestionsReques
 
 
 @router.post("/generate-questions/batch", response_model=AdminBatchGenerateQuestionsResponse)
-def admin_batch_generate_questions(request: Request, req: AdminBatchGenerateQuestionsRequest):
+async def admin_batch_generate_questions(request: Request, req: AdminBatchGenerateQuestionsRequest):
     """
     Batch admin endpoint to trigger question generation for multiple uploaded PDFs.
     
@@ -208,26 +200,21 @@ def admin_batch_generate_questions(request: Request, req: AdminBatchGenerateQues
     
     Returns per-document job status for tracking progress.
     """
-    # Get tenant_id from header (admin should be authenticated)
     tenant_id = request.headers.get("X-Tenant-ID", "niyukti-platform")
     
-    # Map "descriptive" to ["short", "long"]
     mapped_question_types = []
     for qt in req.question_types:
         if qt == "descriptive":
             mapped_question_types.extend(["short", "long"])
         else:
             mapped_question_types.append(qt)
-    # Remove duplicates while preserving order
     mapped_question_types = list(dict.fromkeys(mapped_question_types))
     
-    # Determine difficulty levels to generate
     if req.difficulty == "any":
         difficulty_levels = ["easy", "medium", "hard"]
     else:
         difficulty_levels = [req.difficulty]
     
-    # Validate class range
     if req.from_class > req.to_class:
         raise HTTPException(
             status_code=400,
@@ -237,12 +224,10 @@ def admin_batch_generate_questions(request: Request, req: AdminBatchGenerateQues
     document_statuses: list[DocumentJobStatus] = []
     jobs_created = 0
     
-    with get_session() as session:
-        # Process each document
+    async with get_session_ctx() as session:
         for document_id in req.document_ids:
             try:
-                # Validate document exists
-                document = session.get(Document, document_id)
+                document = await session.get(Document, document_id)
                 if not document:
                     document_statuses.append(DocumentJobStatus(
                         document_id=document_id,
@@ -253,8 +238,7 @@ def admin_batch_generate_questions(request: Request, req: AdminBatchGenerateQues
                     ))
                     continue
                 
-                # Get corpus
-                corpus = session.get(Corpus, document.corpus_id)
+                corpus = await session.get(Corpus, document.corpus_id)
                 if not corpus:
                     document_statuses.append(DocumentJobStatus(
                         document_id=document_id,
@@ -265,7 +249,6 @@ def admin_batch_generate_questions(request: Request, req: AdminBatchGenerateQues
                     ))
                     continue
                 
-                # Validate tenant matches
                 if corpus.tenant_id != tenant_id:
                     document_statuses.append(DocumentJobStatus(
                         document_id=document_id,
@@ -276,7 +259,6 @@ def admin_batch_generate_questions(request: Request, req: AdminBatchGenerateQues
                     ))
                     continue
                 
-                # Validate document has required metadata
                 if not document.class_level or not document.subject:
                     document_statuses.append(DocumentJobStatus(
                         document_id=document_id,
@@ -287,10 +269,8 @@ def admin_batch_generate_questions(request: Request, req: AdminBatchGenerateQues
                     ))
                     continue
                 
-                # Use document's subject if not provided, or validate it matches
                 subject_to_use = req.subject
                 if document.subject and document.subject != req.subject:
-                    # Log warning but proceed with requested subject
                     log.warning(
                         "subject_mismatch",
                         document_id=document_id,
@@ -298,10 +278,8 @@ def admin_batch_generate_questions(request: Request, req: AdminBatchGenerateQues
                         requested_subject=req.subject,
                     )
                 
-                # Create jobs for each difficulty level
                 job_ids = []
                 for difficulty in difficulty_levels:
-                    # Calculate questions per difficulty (distribute evenly)
                     questions_per_difficulty = max(1, req.question_count // len(difficulty_levels))
                     
                     job_data = {
@@ -326,8 +304,8 @@ def admin_batch_generate_questions(request: Request, req: AdminBatchGenerateQues
                         request_json=json.dumps(job_data),
                     )
                     session.add(job)
-                    session.commit()
-                    session.refresh(job)
+                    await session.commit()
+                    await session.refresh(job)
                     job_ids.append(job.id)
                     jobs_created += 1
                     
@@ -343,7 +321,6 @@ def admin_batch_generate_questions(request: Request, req: AdminBatchGenerateQues
                         tenant_id=tenant_id,
                     )
                 
-                # Create status message
                 if len(difficulty_levels) == 1:
                     message = f"Successfully queued generation of {req.question_count} {difficulty_levels[0]} questions for classes {req.from_class}-{req.to_class} in {subject_to_use}"
                 else:
@@ -352,7 +329,7 @@ def admin_batch_generate_questions(request: Request, req: AdminBatchGenerateQues
                 
                 document_statuses.append(DocumentJobStatus(
                     document_id=document_id,
-                    job_id=job_ids[0] if job_ids else None,  # Return first job ID for tracking
+                    job_id=job_ids[0] if job_ids else None,
                     status="queued",
                     message=message,
                 ))
@@ -368,7 +345,7 @@ def admin_batch_generate_questions(request: Request, req: AdminBatchGenerateQues
                     job_id=None,
                     status="failed_terminal",
                     message=f"Error processing document {document_id}: {str(e)}",
-                    error=str(e)[:200],  # Truncate error message
+                    error=str(e)[:200],
                 ))
     
     return AdminBatchGenerateQuestionsResponse(
@@ -380,7 +357,7 @@ def admin_batch_generate_questions(request: Request, req: AdminBatchGenerateQues
 
 
 @router.post("/promote-generated-to-pool")
-def admin_promote_generated_to_pool_deprecated():
+async def admin_promote_generated_to_pool_deprecated():
     """
     Deprecated: per-document promotion is removed.
     """
@@ -388,7 +365,7 @@ def admin_promote_generated_to_pool_deprecated():
 
 
 @router.post("/prewarm-pool")
-def admin_prewarm_pool_deprecated():
+async def admin_prewarm_pool_deprecated():
     """
     Deprecated: per-document promotion is removed.
     """
@@ -396,24 +373,23 @@ def admin_prewarm_pool_deprecated():
 
 
 @router.post("/prewarm-pools", response_model=AdminPrewarmPoolsResponse)
-def admin_prewarm_pools(request: Request):
+async def admin_prewarm_pools(request: Request):
     """
     GLOBAL pool prewarming endpoint.
     PROMOTION ONLY – NO GENERATION.
     """
-    # Global operation: no request body required.
     syllabus = "CBSE"
     syllabus_version = "2024"
-    run = start_prewarm_run(syllabus=syllabus, syllabus_version=syllabus_version)
+    run = await start_prewarm_run(syllabus=syllabus, syllabus_version=syllabus_version)
     try:
-        result = promote_all_generated_questions_to_pools(
+        result = await promote_all_generated_questions_to_pools(
             syllabus=syllabus,
             syllabus_version=syllabus_version,
             prewarm_id=run.id,
         )
         promoted_count = int(result.get("questions_promoted") or 0)
         pools_created = int(result.get("pools_created") or 0)
-        finish_prewarm_run(
+        await finish_prewarm_run(
             prewarm_id=run.id,
             promoted_count=promoted_count,
             pools_created=pools_created,
@@ -428,28 +404,26 @@ def admin_prewarm_pools(request: Request):
             promoted_question_ids=promoted_question_ids,
         )
     except Exception as e:
-        fail_prewarm_run(prewarm_id=run.id, error_message=str(e))
+        await fail_prewarm_run(prewarm_id=run.id, error_message=str(e))
         raise
 
 
 @router.get("/prewarm/{prewarm_id}/questions", response_model=AdminPrewarmQuestionsResponse)
-def admin_get_prewarm_questions(request: Request, prewarm_id: str):
-    questions = get_prewarm_promoted_questions(prewarm_id=prewarm_id)
+async def admin_get_prewarm_questions(request: Request, prewarm_id: str):
+    questions = await get_prewarm_promoted_questions(prewarm_id=prewarm_id)
     if not questions:
-        # Distinguish empty run from not found is intentionally not exposed;
-        # caller should treat missing data as no promoted questions.
         return AdminPrewarmQuestionsResponse(prewarm_id=prewarm_id, questions=[])
     return AdminPrewarmQuestionsResponse(prewarm_id=prewarm_id, questions=questions)
 
 
 @router.post("/invalidate-pools")
-def admin_invalidate_pools(request: Request):
+async def admin_invalidate_pools(request: Request):
     """
     Internal-only pool invalidation for syllabus updates.
     """
     syllabus = request.headers.get("X-Syllabus", "CBSE")
     syllabus_version = request.headers.get("X-Syllabus-Version", "2024")
-    result = invalidate_pools_for_syllabus(
+    result = await invalidate_pools_for_syllabus(
         syllabus=syllabus,
         syllabus_version=syllabus_version,
     )
@@ -462,15 +436,15 @@ def admin_invalidate_pools(request: Request):
 
 
 @router.post("/reindex", response_model=AdminReindexResponse)
-def admin_reindex_documents(request: Request, req: AdminReindexRequest):
+async def admin_reindex_documents(request: Request, req: AdminReindexRequest):
     """
     Admin endpoint to re-index existing documents.
     Creates a single index job for the provided document IDs.
     """
     tenant_id = request.headers.get("X-Tenant-ID", "niyukti-platform")
 
-    with get_session() as session:
-        docs = session.exec(select(Document).where(Document.id.in_(req.document_ids))).all()
+    async with get_session_ctx() as session:
+        docs = (await session.execute(select(Document).where(Document.id.in_(req.document_ids)))).scalars().all()
         if not docs or len(docs) != len(req.document_ids):
             raise HTTPException(status_code=404, detail="some_documents_not_found")
 
@@ -479,7 +453,7 @@ def admin_reindex_documents(request: Request, req: AdminReindexRequest):
             raise HTTPException(status_code=400, detail="documents_multiple_corpus_not_supported")
         corpus_id = next(iter(corpus_ids))
 
-        corpus = session.get(Corpus, corpus_id)
+        corpus = await session.get(Corpus, corpus_id)
         if not corpus:
             raise HTTPException(status_code=404, detail="corpus_not_found")
         if corpus.tenant_id != tenant_id:
@@ -493,8 +467,8 @@ def admin_reindex_documents(request: Request, req: AdminReindexRequest):
             request_json=json.dumps({"document_ids": req.document_ids}),
         )
         session.add(job)
-        session.commit()
-        session.refresh(job)
+        await session.commit()
+        await session.refresh(job)
 
         log.info(
             "admin_reindex_job_created",

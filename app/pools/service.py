@@ -17,10 +17,10 @@ from app.db.models import (
     QuestionPool,
     QuestionPoolStatus,
 )
-from app.db.session import get_session
+from app.db.session import get_session_ctx
 from app.observability.logging import log
 from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlmodel import select
+from sqlalchemy import select
 
 
 def get_pool_key(
@@ -78,9 +78,9 @@ def _resolve_chapter_identity(
     return num, name or f"Chapter {num}", display
 
 
-def start_prewarm_run(*, syllabus: str, syllabus_version: str) -> PrewarmRun:
+async def start_prewarm_run(*, syllabus: str, syllabus_version: str) -> PrewarmRun:
     """Create and persist a prewarm run record."""
-    with get_session() as session:
+    async with get_session_ctx() as session:
         run = PrewarmRun(
             status="running",
             syllabus=syllabus,
@@ -88,19 +88,19 @@ def start_prewarm_run(*, syllabus: str, syllabus_version: str) -> PrewarmRun:
             started_at=datetime.utcnow(),
         )
         session.add(run)
-        session.commit()
-        session.refresh(run)
+        await session.commit()
+        await session.refresh(run)
         return run
 
 
-def finish_prewarm_run(
+async def finish_prewarm_run(
     *,
     prewarm_id: str,
     promoted_count: int,
     pools_created: int,
 ) -> None:
-    with get_session() as session:
-        run = session.get(PrewarmRun, prewarm_id)
+    async with get_session_ctx() as session:
+        run = await session.get(PrewarmRun, prewarm_id)
         if not run:
             return
         run.status = "completed"
@@ -108,22 +108,22 @@ def finish_prewarm_run(
         run.pools_created = int(pools_created)
         run.finished_at = datetime.utcnow()
         session.add(run)
-        session.commit()
+        await session.commit()
 
 
-def fail_prewarm_run(*, prewarm_id: str, error_message: str) -> None:
-    with get_session() as session:
-        run = session.get(PrewarmRun, prewarm_id)
+async def fail_prewarm_run(*, prewarm_id: str, error_message: str) -> None:
+    async with get_session_ctx() as session:
+        run = await session.get(PrewarmRun, prewarm_id)
         if not run:
             return
         run.status = "failed"
         run.error_message = str(error_message)[:1000]
         run.finished_at = datetime.utcnow()
         session.add(run)
-        session.commit()
+        await session.commit()
 
 
-def record_prewarm_promoted_questions(*, prewarm_id: str, question_ids: list[str]) -> None:
+async def record_prewarm_promoted_questions(*, prewarm_id: str, question_ids: list[str]) -> None:
     if not question_ids:
         return
 
@@ -145,41 +145,41 @@ def record_prewarm_promoted_questions(*, prewarm_id: str, question_ids: list[str
         }
         for qid in question_ids
     ]
-    with get_session() as session:
+    async with get_session_ctx() as session:
         insert_stmt = (
             pg_insert(PrewarmRunQuestion)
             .values(rows)
             .on_conflict_do_nothing(index_elements=["prewarm_id", "question_id"])
         )
-        session.exec(insert_stmt)
-        session.commit()
+        await session.execute(insert_stmt)
+        await session.commit()
 
 
-def get_prewarm_promoted_questions(*, prewarm_id: str) -> list[dict]:
+async def get_prewarm_promoted_questions(*, prewarm_id: str) -> list[dict]:
     """Fetch canonical payload for questions promoted in a prewarm run."""
-    with get_session() as session:
-        run = session.get(PrewarmRun, prewarm_id)
+    async with get_session_ctx() as session:
+        run = await session.get(PrewarmRun, prewarm_id)
         if not run:
             return []
 
-        mapped_ids = session.exec(
+        mapped_ids = (await session.execute(
             select(PrewarmRunQuestion.question_id).where(PrewarmRunQuestion.prewarm_id == prewarm_id)
-        ).all()
+        )).scalars().all()
         ordered_ids = [str(qid) for qid in mapped_ids]
         if not ordered_ids:
             return []
 
-        pool_rows = session.exec(
+        pool_rows = (await session.execute(
             select(PoolQuestion, QuestionPool)
             .join(QuestionPool, QuestionPool.id == PoolQuestion.pool_id)
             .where(PoolQuestion.id.in_(ordered_ids))
-        ).all()
-        generated_rows = session.exec(
+        )).all()
+        generated_rows = (await session.execute(
             select(GeneratedQuestion).where(GeneratedQuestion.id.in_(ordered_ids))
-        ).all()
-        citation_rows = session.exec(
+        )).scalars().all()
+        citation_rows = (await session.execute(
             select(QuestionCitation).where(QuestionCitation.question_id.in_(ordered_ids))
-        ).all()
+        )).scalars().all()
 
     pool_by_qid: dict[str, tuple[PoolQuestion, QuestionPool]] = {}
     for pq, pool in pool_rows:
@@ -233,16 +233,16 @@ def get_prewarm_promoted_questions(*, prewarm_id: str) -> list[dict]:
     return out
 
 
-def list_pool_chapters(corpus_id: str, class_level: int, subject: str) -> list[str]:
+async def list_pool_chapters(corpus_id: str, class_level: int, subject: str) -> list[str]:
     """List distinct chapters for a corpus/class/subject."""
-    with get_session() as session:
-        rows = session.exec(
+    async with get_session_ctx() as session:
+        rows = (await session.execute(
             select(Chunk.chapter).where(
                 Chunk.corpus_id == corpus_id,
                 Chunk.class_level == class_level,
                 Chunk.subject == subject,
             )
-        ).all()
+        )).scalars().all()
     chapters = [str(r).strip() for r in rows if r and str(r).strip()]
     if not chapters:
         return ["Unknown Chapter"]
@@ -257,7 +257,7 @@ def list_pool_chapters(corpus_id: str, class_level: int, subject: str) -> list[s
     return out
 
 
-def get_or_create_pool(
+async def get_or_create_pool(
     syllabus: str,
     class_level: int,
     subject: str,
@@ -276,8 +276,8 @@ def get_or_create_pool(
         chapter_name=chapter_name,
     )
     resolved_board = (board or syllabus or "CBSE").strip()
-    with get_session() as session:
-        pool = session.exec(
+    async with get_session_ctx() as session:
+        pool = (await session.execute(
             select(QuestionPool).where(
                 QuestionPool.syllabus == syllabus,
                 QuestionPool.board == resolved_board,
@@ -287,7 +287,7 @@ def get_or_create_pool(
                 QuestionPool.difficulty == difficulty,
                 QuestionPool.syllabus_version == syllabus_version,
             )
-        ).first()
+        )).scalars().first()
         
         if not pool:
             pool = QuestionPool(
@@ -303,8 +303,8 @@ def get_or_create_pool(
                 status=QuestionPoolStatus.pending,
             )
             session.add(pool)
-            session.commit()
-            session.refresh(pool)
+            await session.commit()
+            await session.refresh(pool)
             log.info(
                 "question_pool_created",
                 pool_id=pool.id,
@@ -314,7 +314,7 @@ def get_or_create_pool(
         return pool
 
 
-def get_pool_status(
+async def get_pool_status(
     syllabus: str,
     class_level: int,
     subject: str,
@@ -328,7 +328,7 @@ def get_pool_status(
     """Get pool status from database."""
     resolved_board = (board or syllabus or "CBSE").strip()
     resolved_number = int(chapter_number) if chapter_number is not None else _parse_chapter_number(chapter)
-    with get_session() as session:
+    async with get_session_ctx() as session:
         stmt = select(QuestionPool).where(
             QuestionPool.syllabus == syllabus,
             QuestionPool.board == resolved_board,
@@ -341,11 +341,11 @@ def get_pool_status(
             stmt = stmt.where(QuestionPool.chapter_number == resolved_number)
         else:
             stmt = stmt.where(QuestionPool.chapter == chapter)
-        pool = session.exec(stmt).first()
+        pool = (await session.execute(stmt)).scalars().first()
         return pool.status if pool else None
 
 
-def get_questions_from_pool(
+async def get_questions_from_pool(
     syllabus: str,
     class_level: int,
     subject: str,
@@ -362,7 +362,7 @@ def get_questions_from_pool(
     pool_key = get_pool_key(syllabus, class_level, subject, difficulty, syllabus_version)
     
     # Check if pool exists and is ready
-    pool_status = get_pool_status(syllabus, class_level, subject, chapter, difficulty, syllabus_version)
+    pool_status = await get_pool_status(syllabus, class_level, subject, chapter, difficulty, syllabus_version)
     if pool_status not in (QuestionPoolStatus.ready, QuestionPoolStatus.ready_partial):
         log.warning("pool_not_ready", pool_key=pool_key, status=pool_status)
         return []
@@ -379,10 +379,10 @@ def get_questions_from_pool(
         return []
     
     # Fetch questions from database
-    with get_session() as session:
-        questions = session.exec(
+    async with get_session_ctx() as session:
+        questions = (await session.execute(
             select(PoolQuestion).where(PoolQuestion.id.in_(question_ids))
-        ).all()
+        )).scalars().all()
         
         # Remove fetched IDs from Redis (pop from left)
         redis_client.ltrim(pool_key, min(count, available), -1)
@@ -391,7 +391,7 @@ def get_questions_from_pool(
         return list(questions)
 
 
-def get_questions_from_difficulty_pool(
+async def get_questions_from_difficulty_pool(
     syllabus: str,
     class_level: int,
     subject: str,
@@ -411,17 +411,17 @@ def get_questions_from_difficulty_pool(
         log.warning("pool_empty", pool_key=pool_key)
         return []
 
-    with get_session() as session:
-        questions = session.exec(
+    async with get_session_ctx() as session:
+        questions = (await session.execute(
             select(PoolQuestion).where(PoolQuestion.id.in_(question_ids))
-        ).all()
+        )).scalars().all()
 
         redis_client.ltrim(pool_key, min(count, available), -1)
         log.info("questions_fetched_from_pool", pool_key=pool_key, count=len(questions))
         return list(questions)
 
 
-def add_questions_to_pool(
+async def add_questions_to_pool(
     pool_id: str,
     question_ids: list[str],
     *,
@@ -434,8 +434,8 @@ def add_questions_to_pool(
     Add question IDs to Redis pool list (pre-shuffled).
     Called after pool generation completes.
     """
-    with get_session() as session:
-        pool = session.get(QuestionPool, pool_id)
+    async with get_session_ctx() as session:
+        pool = await session.get(QuestionPool, pool_id)
         if not pool:
             log.error("pool_not_found", pool_id=pool_id)
             return
@@ -489,45 +489,45 @@ def add_questions_to_pool(
         if last_error is not None:
             pool.last_error = last_error
         session.add(pool)
-        session.commit()
+        await session.commit()
 
 
-def mark_pool_generating(pool_id: str) -> None:
+async def mark_pool_generating(pool_id: str) -> None:
     """Mark pool as generating."""
-    with get_session() as session:
-        pool = session.get(QuestionPool, pool_id)
+    async with get_session_ctx() as session:
+        pool = await session.get(QuestionPool, pool_id)
         if pool:
             pool.status = QuestionPoolStatus.generating
             session.add(pool)
-            session.commit()
+            await session.commit()
 
 
-def mark_pool_failed(pool_id: str, error_message: str | None = None) -> None:
+async def mark_pool_failed(pool_id: str, error_message: str | None = None) -> None:
     """Mark pool generation as failed."""
-    with get_session() as session:
-        pool = session.get(QuestionPool, pool_id)
+    async with get_session_ctx() as session:
+        pool = await session.get(QuestionPool, pool_id)
         if pool:
             pool.status = QuestionPoolStatus.failed
             pool.last_error = error_message
             session.add(pool)
-            session.commit()
+            await session.commit()
             log.error("pool_generation_failed", pool_id=pool_id, error=error_message)
 
 
-def mark_pool_ready_partial(pool_id: str, *, requested_count: int, generated_count: int, last_error: str | None = None) -> None:
+async def mark_pool_ready_partial(pool_id: str, *, requested_count: int, generated_count: int, last_error: str | None = None) -> None:
     """Mark pool as ready_partial and persist counts."""
-    with get_session() as session:
-        pool = session.get(QuestionPool, pool_id)
+    async with get_session_ctx() as session:
+        pool = await session.get(QuestionPool, pool_id)
         if pool:
             pool.status = QuestionPoolStatus.ready_partial
             pool.requested_count = requested_count
             pool.generated_count = generated_count
             pool.last_error = last_error
             session.add(pool)
-            session.commit()
+            await session.commit()
 
 
-def promote_generated_questions_to_pools(
+async def promote_generated_questions_to_pools(
     *,
     document_id: str,
     class_level: int,
@@ -551,7 +551,7 @@ def promote_generated_questions_to_pools(
                 out.add(str(item))
         return out
 
-    def _prewarm_pool_redis(*, pool: QuestionPool, new_question_ids: list[str]) -> int:
+    async def _prewarm_pool_redis(*, pool: QuestionPool, new_question_ids: list[str]) -> int:
         """
         PROMOTION ONLY – NO GENERATION.
         Prewarm Redis with pool question IDs without overwriting existing data.
@@ -573,10 +573,10 @@ def promote_generated_questions_to_pools(
             ids_to_add = [qid for qid in new_question_ids if qid not in existing_ids]
         else:
             # Redis missing/partial: add any DB IDs not yet present.
-            with get_session() as session:
-                db_ids = session.exec(
+            async with get_session_ctx() as session:
+                db_ids = (await session.execute(
                     select(PoolQuestion.id).where(PoolQuestion.pool_id == pool.id)
-                ).all()
+                )).scalars().all()
             db_set = _normalize_ids(db_ids)
             ids_to_add = [qid for qid in db_set if qid not in existing_ids]
 
@@ -589,7 +589,7 @@ def promote_generated_questions_to_pools(
         log.info("redis_pool_prewarmed", pool_key=pool_key, count=len(ids_to_add))
         return len(ids_to_add)
 
-    with get_session() as session:
+    async with get_session_ctx() as session:
         stmt = (
             select(GeneratedQuestion)
             .join(QuestionCitation, QuestionCitation.question_id == GeneratedQuestion.id)
@@ -603,7 +603,7 @@ def promote_generated_questions_to_pools(
         if question_types:
             stmt = stmt.where(GeneratedQuestion.qtype.in_(question_types))
 
-        generated = session.exec(stmt).all()
+        generated = (await session.execute(stmt)).scalars().all()
 
     if not generated:
         return {"status": "noop", "reason": "no_generated_questions", "pools_created": 0, "questions_promoted": 0}
@@ -628,10 +628,10 @@ def promote_generated_questions_to_pools(
     pools_created = 0
     questions_promoted = 0
 
-    with get_session() as session:
+    async with get_session_ctx() as session:
         for (board, _syllabus_version, cl, subj, chapter_num, diff, _qtype), items in groups.items():
             # PROMOTION ONLY – NO GENERATION.
-            pool = session.exec(
+            pool = (await session.execute(
                 select(QuestionPool).where(
                     QuestionPool.syllabus == syllabus,
                     QuestionPool.board == board,
@@ -641,7 +641,7 @@ def promote_generated_questions_to_pools(
                     QuestionPool.difficulty == diff,
                     QuestionPool.syllabus_version == _syllabus_version,
                 )
-            ).first()
+            )).scalars().first()
 
             resolved_chapter_name: str | None = None
 
@@ -660,8 +660,8 @@ def promote_generated_questions_to_pools(
                     status=QuestionPoolStatus.ready,
                 )
                 session.add(pool)
-                session.commit()
-                session.refresh(pool)
+                await session.commit()
+                await session.refresh(pool)
                 pools_created += 1
 
             rows = []
@@ -681,9 +681,9 @@ def promote_generated_questions_to_pools(
             existing_chunk_ids: set[str] = set()
             existing_chunks_by_id: dict[str, Chunk] = {}
             if candidate_chunk_ids:
-                existing_chunks = session.exec(
+                existing_chunks = (await session.execute(
                     select(Chunk).where(Chunk.id.in_(list(candidate_chunk_ids)))
-                ).all()
+                )).scalars().all()
                 existing_chunks_by_id = {str(ch.id): ch for ch in existing_chunks}
                 existing_chunk_ids = set(existing_chunks_by_id.keys())
 
@@ -741,8 +741,8 @@ def promote_generated_questions_to_pools(
                 .on_conflict_do_nothing(index_elements=["id"])
                 .returning(PoolQuestion.id)
             )
-            inserted = session.exec(insert_stmt).all()
-            session.commit()
+            inserted = (await session.execute(insert_stmt)).scalars().all()
+            await session.commit()
 
             inserted_ids = [str(row[0] if isinstance(row, tuple) else row) for row in inserted]
             if inserted_ids:
@@ -760,9 +760,9 @@ def promote_generated_questions_to_pools(
             if pool.status != QuestionPoolStatus.ready:
                 pool.status = QuestionPoolStatus.ready
             session.add(pool)
-            session.commit()
+            await session.commit()
 
-            _prewarm_pool_redis(pool=pool, new_question_ids=inserted_ids)
+            await _prewarm_pool_redis(pool=pool, new_question_ids=inserted_ids)
 
     return {
         "status": "success",
@@ -771,7 +771,7 @@ def promote_generated_questions_to_pools(
     }
 
 
-def promote_all_generated_questions_to_pools(
+async def promote_all_generated_questions_to_pools(
     *,
     syllabus: str,
     syllabus_version: str,
@@ -791,7 +791,7 @@ def promote_all_generated_questions_to_pools(
                 out.add(str(item))
         return out
 
-    def _prewarm_pool_redis(*, pool: QuestionPool, new_question_ids: list[str]) -> int:
+    async def _prewarm_pool_redis(*, pool: QuestionPool, new_question_ids: list[str]) -> int:
         """
         PROMOTION ONLY – NO GENERATION.
         Prewarm Redis with pool question IDs without overwriting existing data.
@@ -813,10 +813,10 @@ def promote_all_generated_questions_to_pools(
             ids_to_add = [qid for qid in new_question_ids if qid not in existing_ids]
         else:
             # Redis missing/partial: add any DB IDs not yet present.
-            with get_session() as session:
-                db_ids = session.exec(
+            async with get_session_ctx() as session:
+                db_ids = (await session.execute(
                     select(PoolQuestion.id).where(PoolQuestion.pool_id == pool.id)
-                ).all()
+                )).scalars().all()
             db_set = _normalize_ids(db_ids)
             ids_to_add = [qid for qid in db_set if qid not in existing_ids]
 
@@ -829,12 +829,12 @@ def promote_all_generated_questions_to_pools(
         log.info("redis_pool_prewarmed", pool_key=pool_key, count=len(ids_to_add))
         return len(ids_to_add)
 
-    with get_session() as session:
-        generated = session.exec(
+    async with get_session_ctx() as session:
+        generated = (await session.execute(
             select(GeneratedQuestion)
             .outerjoin(PoolQuestion, PoolQuestion.id == GeneratedQuestion.id)
             .where(PoolQuestion.id.is_(None))
-        ).all()
+        )).scalars().all()
 
     if not generated:
         return {
@@ -864,13 +864,13 @@ def promote_all_generated_questions_to_pools(
     questions_promoted = 0
     promoted_question_ids: list[str] = []
 
-    with get_session() as session:
+    async with get_session_ctx() as session:
         for (_syllabus, _syllabus_version, cl, subj, chapter_num, diff, _qtype), items in groups.items():
             # PROMOTION ONLY – NO GENERATION.
             resolved_chapter_name: str | None = None
             pool_chapter_name = f"Chapter {chapter_num}"
             pool_chapter = _build_chapter_display(chapter_num, pool_chapter_name)
-            pool = session.exec(
+            pool = (await session.execute(
                 select(QuestionPool).where(
                     QuestionPool.syllabus == _syllabus,
                     QuestionPool.board == _syllabus,
@@ -880,7 +880,7 @@ def promote_all_generated_questions_to_pools(
                     QuestionPool.difficulty == diff,
                     QuestionPool.syllabus_version == _syllabus_version,
                 )
-            ).first()
+            )).scalars().first()
 
             if not pool:
                 pool = QuestionPool(
@@ -896,8 +896,8 @@ def promote_all_generated_questions_to_pools(
                     status=QuestionPoolStatus.ready,
                 )
                 session.add(pool)
-                session.commit()
-                session.refresh(pool)
+                await session.commit()
+                await session.refresh(pool)
                 pools_created += 1
 
             rows = []
@@ -917,9 +917,9 @@ def promote_all_generated_questions_to_pools(
             existing_chunk_ids: set[str] = set()
             existing_chunks_by_id: dict[str, Chunk] = {}
             if candidate_chunk_ids:
-                existing_chunks = session.exec(
+                existing_chunks = (await session.execute(
                     select(Chunk).where(Chunk.id.in_(list(candidate_chunk_ids)))
-                ).all()
+                )).scalars().all()
                 existing_chunks_by_id = {str(ch.id): ch for ch in existing_chunks}
                 existing_chunk_ids = set(existing_chunks_by_id.keys())
 
@@ -980,15 +980,15 @@ def promote_all_generated_questions_to_pools(
                 .on_conflict_do_nothing(index_elements=["id"])
                 .returning(PoolQuestion.id)
             )
-            result = session.exec(insert_stmt)
+            result = await session.execute(insert_stmt)
             inserted_ids = result.scalars().all()
-            session.commit()
+            await session.commit()
 
             if inserted_ids:
                 questions_promoted += len(inserted_ids)
                 promoted_question_ids.extend(inserted_ids)
                 if prewarm_id:
-                    record_prewarm_promoted_questions(prewarm_id=prewarm_id, question_ids=inserted_ids)
+                    await record_prewarm_promoted_questions(prewarm_id=prewarm_id, question_ids=inserted_ids)
 
             if resolved_chapter_name and (
                 (pool.chapter_name or "").strip() != resolved_chapter_name
@@ -1001,9 +1001,9 @@ def promote_all_generated_questions_to_pools(
             if pool.status != QuestionPoolStatus.ready:
                 pool.status = QuestionPoolStatus.ready
             session.add(pool)
-            session.commit()
+            await session.commit()
 
-            _prewarm_pool_redis(pool=pool, new_question_ids=inserted_ids)
+            await _prewarm_pool_redis(pool=pool, new_question_ids=inserted_ids)
 
     return {
         "status": "success",
@@ -1013,7 +1013,7 @@ def promote_all_generated_questions_to_pools(
     }
 
 
-def invalidate_pools_for_syllabus(*, syllabus: str, syllabus_version: str) -> dict[str, int]:
+async def invalidate_pools_for_syllabus(*, syllabus: str, syllabus_version: str) -> dict[str, int]:
     """
     Internal optimization helper:
     invalidate pools and Redis cache for a syllabus/version change.
@@ -1021,13 +1021,13 @@ def invalidate_pools_for_syllabus(*, syllabus: str, syllabus_version: str) -> di
     redis_client = get_redis_client()
     pools_invalidated = 0
     redis_keys_deleted = 0
-    with get_session() as session:
-        pools = session.exec(
+    async with get_session_ctx() as session:
+        pools = (await session.execute(
             select(QuestionPool).where(
                 QuestionPool.syllabus == syllabus,
                 QuestionPool.syllabus_version == syllabus_version,
             )
-        ).all()
+        )).scalars().all()
         for pool in pools:
             pool.status = QuestionPoolStatus.pending
             pool.last_error = "invalidated_due_to_syllabus_update"
@@ -1044,5 +1044,5 @@ def invalidate_pools_for_syllabus(*, syllabus: str, syllabus_version: str) -> di
                 redis_keys_deleted += int(redis_client.delete(pool_key) or 0)
             except Exception:
                 continue
-        session.commit()
+        await session.commit()
     return {"pools_invalidated": pools_invalidated, "redis_keys_deleted": redis_keys_deleted}

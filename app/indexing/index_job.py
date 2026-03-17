@@ -3,25 +3,25 @@ from __future__ import annotations
 import json
 from typing import Callable
 
-from sqlmodel import select
+from sqlalchemy import select
 
 from app.db.models import Document, GenerationJob
-from app.db.session import get_session
+from app.db.session import get_session_ctx
 from app.indexing.qdrant_pipeline import index_document_qdrant
 from app.observability.logging import log
 
 
-def _update_job_progress(job_id: str, progress_data: dict) -> None:
+async def _update_job_progress(job_id: str, progress_data: dict) -> None:
     """Update job progress by writing to result_json (for RUNNING status)."""
-    with get_session() as session:
-        job = session.get(GenerationJob, job_id)
+    async with get_session_ctx() as session:
+        job = await session.get(GenerationJob, job_id)
         if job:
             job.result_json = json.dumps(progress_data)
             session.add(job)
-            session.commit()
+            await session.commit()
 
 
-def run_index_job(
+async def run_index_job(
     job: GenerationJob,
     *,
     on_document_complete: Callable[[int, int, Document, int], None] | None = None,
@@ -38,15 +38,15 @@ def run_index_job(
     req = json.loads(job.request_json)
     doc_ids = req.get("document_ids")
 
-    with get_session() as session:
+    async with get_session_ctx() as session:
         q = select(Document).where(Document.corpus_id == job.corpus_id)
         if doc_ids:
             q = q.where(Document.id.in_(doc_ids))
-        docs = session.exec(q).all()
+        docs = (await session.execute(q)).scalars().all()
 
     if not docs:
         log.info("index_job_no_documents", job_id=job.id, corpus_id=job.corpus_id)
-        _update_job_progress(job.id, {
+        await _update_job_progress(job.id, {
             "phase": "complete",
             "documents_processed": 0,
             "chunks_created": 0,
@@ -55,8 +55,7 @@ def run_index_job(
         })
         return
 
-    # Update progress: starting
-    _update_job_progress(job.id, {
+    await _update_job_progress(job.id, {
         "phase": "extracting",
         "documents_total": len(docs),
         "documents_processed": 0,
@@ -66,11 +65,10 @@ def run_index_job(
     total_chunks = 0
 
     for doc_idx, doc in enumerate(docs):
-        produced_count = index_document_qdrant(document_id=doc.id)
+        produced_count = await index_document_qdrant(document_id=doc.id)
         total_chunks += produced_count
         
-        # Update progress after each document
-        _update_job_progress(job.id, {
+        await _update_job_progress(job.id, {
             "phase": "chunking",
             "documents_total": len(docs),
             "documents_processed": doc_idx + 1,
@@ -89,8 +87,7 @@ def run_index_job(
         if on_document_complete:
             on_document_complete(doc_idx + 1, len(docs), doc, produced_count)
 
-    # Update progress: starting embedding
-    _update_job_progress(job.id, {
+    await _update_job_progress(job.id, {
         "phase": "embedding",
         "documents_total": len(docs),
         "documents_processed": len(docs),
@@ -98,8 +95,7 @@ def run_index_job(
         "chunks_embedded": 0,
     })
 
-    # Final progress update
-    _update_job_progress(job.id, {
+    await _update_job_progress(job.id, {
         "phase": "complete",
         "documents_total": len(docs),
         "documents_processed": len(docs),
@@ -107,5 +103,3 @@ def run_index_job(
         "chunks_indexed": total_chunks,
         "chunks_embedded": total_chunks,
     })
-
-

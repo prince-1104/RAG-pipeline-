@@ -7,10 +7,25 @@ from __future__ import annotations
 import re
 
 from sqlalchemy import text
-from sqlmodel import Session
+from sqlmodel import Session, create_engine
 
-from app.db.session import get_engine, get_session
 from app.observability.logging import log
+from app.settings import get_settings
+
+
+def _get_sync_engine():
+    """
+    This engine is sync intentionally -- migrations must run synchronously
+    (Alembic requires sync connections). The application uses the async engine
+    defined in app/db/session.py.
+    """
+    settings = get_settings()
+    db_url = settings.database_url
+    if db_url.startswith("postgresql://") and "+asyncpg" not in db_url and "+psycopg" not in db_url:
+        db_url = db_url.replace("postgresql://", "postgresql+psycopg://", 1)
+    elif db_url.startswith("postgres://"):
+        db_url = db_url.replace("postgres://", "postgresql+psycopg://", 1)
+    return create_engine(db_url, echo=False, pool_pre_ping=True)
 
 
 def migrate_add_document_syllabus_fields() -> None:
@@ -18,7 +33,7 @@ def migrate_add_document_syllabus_fields() -> None:
     Add syllabus, syllabus_version, and chapter columns to document table if they don't exist.
     This migration is idempotent - safe to run multiple times.
     """
-    engine = get_engine()
+    engine = _get_sync_engine()
     
     with Session(engine) as session:
         try:
@@ -98,7 +113,7 @@ def migrate_add_job_kind_admin_generate_questions() -> None:
     Add 'admin_generate_questions' to the JobKind enum if it doesn't exist.
     Note: This assumes PostgreSQL enum type. For other databases, enum handling differs.
     """
-    engine = get_engine()
+    engine = _get_sync_engine()
     
     # Only run for PostgreSQL
     if not engine.url.drivername.startswith("postgresql"):
@@ -148,7 +163,7 @@ def migrate_add_question_pool_status_ready_partial() -> None:
     Add 'ready_partial' to the QuestionPoolStatus enum if it doesn't exist.
     Only needed when QuestionPoolStatus is backed by a PostgreSQL enum type.
     """
-    engine = get_engine()
+    engine = _get_sync_engine()
     if not engine.url.drivername.startswith("postgresql"):
         log.info("migration_skipped", reason="not_postgresql", migration="add_question_pool_status_enum")
         return
@@ -194,7 +209,7 @@ def migrate_add_question_pool_bookkeeping_fields() -> None:
     Add requested_count, generated_count, last_error columns to questionpool table if missing.
     Idempotent.
     """
-    engine = get_engine()
+    engine = _get_sync_engine()
     with Session(engine) as session:
         try:
             result = session.exec(
@@ -229,7 +244,7 @@ def migrate_add_question_pool_chapter() -> None:
     Add chapter column to questionpool table if missing.
     Idempotent.
     """
-    engine = get_engine()
+    engine = _get_sync_engine()
     with Session(engine) as session:
         try:
             result = session.exec(
@@ -294,7 +309,7 @@ def migrate_add_generatedquestion_chapter_identity() -> None:
     Also backfill best-effort values from existing chapter string.
     Idempotent.
     """
-    engine = get_engine()
+    engine = _get_sync_engine()
     with Session(engine) as session:
         try:
             result = session.exec(
@@ -376,6 +391,30 @@ def migrate_add_generatedquestion_chapter_identity() -> None:
             raise
 
 
+def migrate_add_generationjob_retry_count() -> None:
+    """Add retry_count to generationjob if missing (idempotent)."""
+    engine = _get_sync_engine()
+    with Session(engine) as session:
+        try:
+            result = session.exec(
+                text("""
+                    SELECT column_name FROM information_schema.columns
+                    WHERE table_name = 'generationjob' AND column_name = 'retry_count'
+                """)
+            ).all()
+            if result:
+                log.info("migration_column_exists", table="generationjob", column="retry_count")
+                return
+            log.info("migration_adding_column", table="generationjob", column="retry_count")
+            session.exec(text("ALTER TABLE generationjob ADD COLUMN retry_count INTEGER DEFAULT 0"))
+            session.commit()
+            log.info("migration_complete", migration="add_generationjob_retry_count")
+        except Exception as e:
+            session.rollback()
+            log.exception("migration_error", error=str(e))
+            raise
+
+
 def run_all_migrations() -> None:
     """Run all pending migrations."""
     log.info("migrations_starting")
@@ -385,6 +424,7 @@ def run_all_migrations() -> None:
     migrate_add_question_pool_bookkeeping_fields()
     migrate_add_question_pool_chapter()
     migrate_add_generatedquestion_chapter_identity()
+    migrate_add_generationjob_retry_count()
     log.info("migrations_complete")
 
 

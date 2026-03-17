@@ -5,12 +5,11 @@ import re
 from datetime import datetime
 
 from fastapi import HTTPException
-from sqlalchemy import func
-from sqlmodel import select
+from sqlalchemy import func, select
 
 from app.api.v1.schemas.generation import GenerateRequest, GenerateResponse, GeneratedQuestionOut
 from app.db.models import Chunk, GeneratedQuestion, JobStatus, QuestionCitation
-from app.db.session import get_session
+from app.db.session import get_session_ctx
 from app.generation.sync import generate_questions_sync
 from app.retrieval.retriever import _normalize_subject
 from app.observability.logging import log
@@ -25,7 +24,7 @@ class TerminalError(RuntimeError):
     """A job failure that should not be retried."""
 
 
-def _list_available_chapters(
+async def _list_available_chapters(
     *,
     corpus_id: str,
     document_id: str | None,
@@ -33,8 +32,8 @@ def _list_available_chapters(
     subject: str,
 ) -> list[str]:
     normalized_subject = _normalize_subject(subject)
-    with get_session() as session:
-        rows = session.exec(
+    async with get_session_ctx() as session:
+        rows = (await session.execute(
             select(Chunk.chapter)
             .where(
                 Chunk.corpus_id == corpus_id,
@@ -43,12 +42,12 @@ def _list_available_chapters(
                 *( [Chunk.document_id == document_id] if document_id else [] ),
             )
             .distinct()
-        ).all()
+        )).scalars().all()
     chapters = [str(r).strip() for r in rows if r and str(r).strip()]
     return chapters or ["Unknown Chapter"]
 
 
-def _resolve_requested_chapters(req: GenerateRequest, *, document_id: str | None) -> list[str]:
+async def _resolve_requested_chapters(req: GenerateRequest, *, document_id: str | None) -> list[str]:
     """
     Normalize requested chapters to match stored chapter strings.
 
@@ -61,7 +60,7 @@ def _resolve_requested_chapters(req: GenerateRequest, *, document_id: str | None
     if not requested:
         return requested
 
-    available = _list_available_chapters(
+    available = await _list_available_chapters(
         corpus_id=req.corpus_id,
         document_id=document_id,
         class_level=req.blueprint.constraints.class_level,
@@ -90,7 +89,7 @@ def _resolve_requested_chapters(req: GenerateRequest, *, document_id: str | None
         # Numeric chapter like "13" or "1" -> resolve to corpus canonical chapter name.
         if re.fullmatch(r"\d+", ch):
             num = int(ch)
-            with get_session() as session:
+            async with get_session_ctx() as session:
                 base = (
                     select(Chunk.chapter)
                     .where(Chunk.corpus_id == req.corpus_id)
@@ -102,7 +101,7 @@ def _resolve_requested_chapters(req: GenerateRequest, *, document_id: str | None
                 matches: list[str] = []
                 for pattern in _numeric_chapter_patterns(num):
                     q = base.where(Chunk.chapter.ilike(pattern))
-                    rows = session.exec(q.distinct()).all()
+                    rows = (await session.execute(q.distinct())).scalars().all()
                     matches = [str(r).strip() for r in rows if r and str(r).strip()]
                     if matches:
                         break
@@ -117,7 +116,7 @@ def _resolve_requested_chapters(req: GenerateRequest, *, document_id: str | None
                     )
                     if document_id:
                         q_num = q_num.where(Chunk.document_id == document_id)
-                    rows = session.exec(q_num.distinct()).all()
+                    rows = (await session.execute(q_num.distinct())).scalars().all()
                     matches = [str(r).strip() for r in rows if r and str(r).strip()]
                 if len(matches) == 0:
                     available_preview = available[:5] if available else []
@@ -159,18 +158,18 @@ def _resolve_requested_chapters(req: GenerateRequest, *, document_id: str | None
     return deduped
 
 
-def _chunk_counts_by_chapter(req: GenerateRequest, *, document_id: str | None) -> dict[str, int]:
+async def _chunk_counts_by_chapter(req: GenerateRequest, *, document_id: str | None) -> dict[str, int]:
     chapters = list(req.blueprint.constraints.chapters or [])
     if req.blueprint.constraints.per_chapter and len(chapters) <= 1:
-        chapters = _list_available_chapters(
+        chapters = await _list_available_chapters(
             corpus_id=req.corpus_id,
             document_id=document_id,
             class_level=req.blueprint.constraints.class_level,
             subject=req.blueprint.constraints.subject,
         )
     normalized_subject = _normalize_subject(req.blueprint.constraints.subject)
-    with get_session() as session:
-        rows = session.exec(
+    async with get_session_ctx() as session:
+        rows = (await session.execute(
             select(Chunk.chapter, func.count(Chunk.id))
             .where(
                 Chunk.corpus_id == req.corpus_id,
@@ -180,12 +179,12 @@ def _chunk_counts_by_chapter(req: GenerateRequest, *, document_id: str | None) -
                 *( [Chunk.document_id == document_id] if document_id else [] ),
             )
             .group_by(Chunk.chapter)
-        ).all()
+        )).all()
     return {str(ch): int(count) for ch, count in rows}
 
 
-def _preflight_validate(req: GenerateRequest, *, document_id: str | None) -> bool:
-    counts = _chunk_counts_by_chapter(req, document_id=document_id)
+async def _preflight_validate(req: GenerateRequest, *, document_id: str | None) -> bool:
+    counts = await _chunk_counts_by_chapter(req, document_id=document_id)
     total_chunks = sum(counts.values())
     target = int(req.blueprint.count)
     s = get_settings()
@@ -314,7 +313,7 @@ def _parse_chapter_identity(chapter_value: str | None, fallback_chapter: str | N
     return None, source
 
 
-def run_generate_job(job) -> dict:
+async def run_generate_job(job) -> dict:
     """
     Async generation job:
     - applies preflight validation
@@ -325,7 +324,7 @@ def run_generate_job(job) -> dict:
     req = GenerateRequest.model_validate(raw_req)
     document_id = str(raw_req.get("document_id") or "").strip() or None
     # Normalize chapters (e.g., "9" -> "Chapter 9: ...") so DB filters match.
-    resolved_chapters = _resolve_requested_chapters(req, document_id=document_id)
+    resolved_chapters = await _resolve_requested_chapters(req, document_id=document_id)
     if resolved_chapters:
         req.blueprint.constraints.chapters = resolved_chapters
     log.info(
@@ -335,7 +334,7 @@ def run_generate_job(job) -> dict:
         scope="document-scoped" if document_id else "corpus-wide",
         chapters=resolved_chapters,
     )
-    _preflight_validate(req, document_id=document_id)
+    await _preflight_validate(req, document_id=document_id)
 
     target = int(req.blueprint.count)
     min_needed = max(1, int(target * 0.6))
@@ -355,7 +354,7 @@ def run_generate_job(job) -> dict:
         req_local.blueprint.difficulty_mix = _scaled_difficulty_mix(req_local, deficit)
         attempted.append(name)
         try:
-            resp: GenerateResponse = generate_questions_sync(req_local, document_id=document_id)
+            resp: GenerateResponse = await generate_questions_sync(req_local, document_id=document_id)
         except HTTPException as exc:
             last_error = exc
             continue
@@ -392,15 +391,15 @@ def run_generate_job(job) -> dict:
 
     # Persist generated questions + citations for auditability (institutes care).
     if document_id:
-        with get_session() as session:
-            db_job = session.get(type(job), job.id)
+        async with get_session_ctx() as session:
+            db_job = await session.get(type(job), job.id)
             if db_job:
                 db_job.document_id = document_id
                 session.add(db_job)
-                session.commit()
+                await session.commit()
 
     if generated:
-        with get_session() as session:
+        async with get_session_ctx() as session:
             # Build all question rows first, flush once to assign IDs.
             all_questions: list[GeneratedQuestion] = []
             for q in generated:
@@ -429,7 +428,7 @@ def run_generate_job(job) -> dict:
                 )
 
             session.add_all(all_questions)
-            session.flush()  # assigns IDs without committing
+            await session.flush()
 
             # Only persist citations for chunks that exist in DB (Qdrant can return stale/missing chunk IDs).
             citation_chunk_ids = {cit.chunk_id for q in generated for cit in q.citations}
@@ -441,7 +440,7 @@ def run_generate_job(job) -> dict:
             if citation_chunk_ids:
                 valid_chunk_query = valid_chunk_query.where(Chunk.id.in_(citation_chunk_ids))
             valid_chunk_ids = set(
-                session.exec(valid_chunk_query).all() if citation_chunk_ids else set()
+                (await session.execute(valid_chunk_query)).scalars().all() if citation_chunk_ids else set()
             )
 
             all_citations: list[QuestionCitation] = []
@@ -473,7 +472,7 @@ def run_generate_job(job) -> dict:
             if all_citations:
                 session.add_all(all_citations)
 
-            session.commit()
+            await session.commit()
 
         log.info(
             "generation_persisted",
@@ -516,5 +515,3 @@ def run_generate_job(job) -> dict:
         "error_code": error_code,
         "error_message": error_message,
     }
-
-

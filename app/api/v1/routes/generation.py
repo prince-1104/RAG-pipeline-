@@ -7,7 +7,7 @@ from fastapi import APIRouter, HTTPException, Request
 from app.api.v1.schemas.generation import GenerateJobResponse, GenerateRequest, GenerateResponse
 from app.api.v1.schemas.pools import PoolRequest, PoolResponse
 from app.db.models import Corpus, GenerationJob, JobKind, JobStatus, QuestionPoolStatus
-from app.db.session import get_session
+from app.db.session import get_session_ctx
 from app.observability.logging import log
 from app.pools.service import get_pool_status, get_questions_from_difficulty_pool, list_pool_chapters
 
@@ -16,7 +16,7 @@ router = APIRouter()
 
 
 @router.post("", response_model=GenerateResponse)
-def generate_sync(request: Request, req: GenerateRequest):
+async def generate_sync(request: Request, req: GenerateRequest):
     """
     DEPRECATED: Synchronous generation (kept for backward compatibility).
     This endpoint still calls LLMs synchronously and should be avoided.
@@ -26,9 +26,9 @@ def generate_sync(request: Request, req: GenerateRequest):
 
 
 @router.post("/jobs", response_model=GenerateJobResponse)
-def generate_async(request: Request, req: GenerateRequest):
-    with get_session() as session:
-        corpus = session.get(Corpus, req.corpus_id)
+async def generate_async(request: Request, req: GenerateRequest):
+    async with get_session_ctx() as session:
+        corpus = await session.get(Corpus, req.corpus_id)
         if not corpus:
             raise HTTPException(status_code=404, detail="corpus_not_found")
         if corpus.tenant_id != req.tenant_id:
@@ -42,15 +42,15 @@ def generate_async(request: Request, req: GenerateRequest):
             request_json=req.model_dump_json(),
         )
         session.add(job)
-        session.commit()
-        session.refresh(job)
+        await session.commit()
+        await session.refresh(job)
         return GenerateJobResponse(job_id=job.id, status=job.status.value)
 
 
 @router.get("/jobs/{job_id}/result", response_model=GenerateResponse)
-def get_generation_result(request: Request, job_id: str):
-    with get_session() as session:
-        job = session.get(GenerationJob, job_id)
+async def get_generation_result(request: Request, job_id: str):
+    async with get_session_ctx() as session:
+        job = await session.get(GenerationJob, job_id)
         if not job:
             raise HTTPException(status_code=404, detail="job_not_found")
         if job.kind.value != "generate":
@@ -62,7 +62,7 @@ def get_generation_result(request: Request, job_id: str):
 
 
 @router.post("/pools", response_model=PoolResponse)
-def serve_from_pool(request: Request, req: PoolRequest):
+async def serve_from_pool(request: Request, req: PoolRequest):
     """
     FAST PATH: Serve questions from pre-generated pools (NO LLM calls).
     
@@ -75,17 +75,15 @@ def serve_from_pool(request: Request, req: PoolRequest):
     if not internal_request:
         raise HTTPException(status_code=403, detail="pool_serving_internal_only")
 
-    # Validate corpus
-    with get_session() as session:
-        corpus = session.get(Corpus, req.corpus_id)
+    async with get_session_ctx() as session:
+        corpus = await session.get(Corpus, req.corpus_id)
         if not corpus:
             raise HTTPException(status_code=404, detail="corpus_not_found")
         if corpus.tenant_id != req.tenant_id:
             raise HTTPException(status_code=403, detail="tenant_mismatch")
     
-    chapters = list_pool_chapters(req.corpus_id, req.class_level, req.subject)
+    chapters = await list_pool_chapters(req.corpus_id, req.class_level, req.subject)
 
-    # Check each difficulty pool
     all_questions = []
     pool_info = {}
     pool_info_by_chapter: dict[str, dict[str, str]] = {}
@@ -108,7 +106,7 @@ def serve_from_pool(request: Request, req: PoolRequest):
         count_remaining = count
 
         for chapter in chapters:
-            pool_status = get_pool_status(
+            pool_status = await get_pool_status(
                 syllabus=req.syllabus,
                 class_level=req.class_level,
                 subject=req.subject,
@@ -120,7 +118,7 @@ def serve_from_pool(request: Request, req: PoolRequest):
             pool_statuses.append(pool_status.value if pool_status else "pending")
 
         if any(status in (QuestionPoolStatus.ready.value, QuestionPoolStatus.ready_partial.value) for status in pool_statuses):
-            questions = get_questions_from_difficulty_pool(
+            questions = await get_questions_from_difficulty_pool(
                 syllabus=req.syllabus,
                 class_level=req.class_level,
                 subject=req.subject,
@@ -149,7 +147,6 @@ def serve_from_pool(request: Request, req: PoolRequest):
 
         pool_info[difficulty] = next(iter(pool_info_by_chapter[difficulty].values()))
     
-    # Return response
     if overall_status in ("ready", "ready_partial") and all_questions:
         return PoolResponse(
             questions=all_questions,
@@ -158,12 +155,9 @@ def serve_from_pool(request: Request, req: PoolRequest):
             pool_info_by_chapter=pool_info_by_chapter,
         )
     else:
-        # Return 202 Accepted - pool is not ready (no generation triggered here)
         return PoolResponse(
             questions=None,
             status="generating",
             pool_info=pool_info,
             pool_info_by_chapter=pool_info_by_chapter,
         )
-
-

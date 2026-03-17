@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import time
 
 from fastapi import FastAPI, HTTPException, Request
@@ -138,9 +139,9 @@ def create_app() -> FastAPI:
             observe_request(request, time.perf_counter() - start)
 
     @app.on_event("startup")
-    def _startup() -> None:
+    async def _startup() -> None:
         try:
-            init_db()
+            await init_db()
         except Exception as e:
             log.warning(
                 "database_init_failed_during_startup",
@@ -150,7 +151,7 @@ def create_app() -> FastAPI:
             )
         
         try:
-            ensure_qdrant_payload_indexes()
+            await asyncio.to_thread(ensure_qdrant_payload_indexes)
         except Exception as e:
             log.warning(
                 "qdrant_init_failed_during_startup",
