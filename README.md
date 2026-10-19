@@ -1,5 +1,5 @@
 
-# Niyukti RAG Question Generation Engine
+# RAG Question Generation Engine
 
 RAG (Retrieval-Augmented Generation) question generation API for CBSE PDFs.
 
